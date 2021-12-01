@@ -515,7 +515,6 @@ impl<const K: usize, const V: usize> Lsm<K, V> {
 
         if self.dirty_bytes > self.config.max_log_length {
             log::debug!("flushing log");
-            self.log.get_mut().sync_all()?;
             let memtable = std::mem::take(&mut self.memtable);
             let sst_id = self.next_sstable_id;
             if let Err(e) = write_sstable(&self.path, sst_id, &memtable, false) {
