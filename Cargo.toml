@@ -1,0 +1,12 @@
+[package]
+name = "tiny-lsm"
+version = "0.1.0"
+edition = "2021"
+authors = ["Tyler Neely <t@jujit.su>"]
+description = "a dead-simple in-memory blocking LSM tree for constant-sized keys and values"
+license = "GPL-3.0"
+
+[dependencies]
+crc32fast = "1.2.2"
+zstd = "0.9.0"
+log = "0.4.14"
