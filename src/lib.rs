@@ -3,7 +3,7 @@
 //!
 //! Uses crc32fast to checksum all key-value pairs in the log and
 //! sstables. Uses zstd to compress all sstables. Performs sstable
-//! compression in the background in a low-priority thread.
+//! compaction in the background.
 //!
 //! Because the data is in-memory, there is no need to put bloom
 //! filters on the sstables, and read operations cannot fail due
