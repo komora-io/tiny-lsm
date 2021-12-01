@@ -6,8 +6,19 @@
 //! compression in the background in a low-priority thread.
 //!
 //! Because the data is in-memory, there is no need to put bloom
-//! filters on the sstables, and get / range cannot fail due
-//! to IO issues. This is a bad choice for large data sets if you
+//! filters on the sstables, and read operations cannot fail due
+//! to IO issues.
+//!
+//! `Lsm` implements `Deref<Target=BTree<[u8; K], [u8; V]>>`
+//! to immutably access the data directly without any IO or
+//! blocking.
+//!
+//! `Lsm::insert` writes all data into a 32-kb `BufWriter`
+//! in front of a log file, so it will block for very
+//! short periods of time here and there. SST compaction
+//! is handled completely in the background.
+//!
+//! This is a bad choice for large data sets if you
 //! require quick recovery time because it needs to read all of
 //! the sstables and the write ahead log when starting up.
 //!
@@ -222,7 +233,7 @@ fn write_sstable<const K: usize, const V: usize>(
 ) -> Result<()> {
     let sst_dir_path = path.join(SSTABLE_DIR);
     let sst_path = if tmp_mv {
-        sst_dir_path.join(format!("{}-tmp", id))
+        sst_dir_path.join(format!("{:x}-tmp", id))
     } else {
         sst_dir_path.join(id_format(id))
     };
@@ -246,6 +257,7 @@ fn write_sstable<const K: usize, const V: usize>(
     bw.flush()?;
 
     bw.get_mut().get_mut().sync_all()?;
+    fs::File::open(path.join(SSTABLE_DIR))?.sync_all()?;
 
     if tmp_mv {
         let new_path = sst_dir_path.join(id_format(id));
@@ -318,11 +330,36 @@ impl<const K: usize, const V: usize> std::ops::Deref for Lsm<K, V> {
 }
 
 impl<const K: usize, const V: usize> Lsm<K, V> {
+    /// Recover the LSM off disk. Make sure to never
+    /// recover a DB using different K, V parameters than
+    /// it was created with, or there may be data loss.
+    ///
+    /// This is an O(N) operation and involves reading
+    /// all previously written sstables and the log,
+    /// to recover all data into an in-memory `BTreeMap`.
     pub fn recover<P: AsRef<Path>>(p: P) -> Result<Lsm<K, V>> {
         let path = p.as_ref();
         if !path.exists() {
             fs::create_dir_all(path)?;
             fs::create_dir(path.join(SSTABLE_DIR))?;
+            fs::File::open(path.join(SSTABLE_DIR))?.sync_all()?;
+            fs::File::open(path)?.sync_all()?;
+            let mut parent_opt = path.parent();
+
+            // need to recursively fsync parents since
+            // we used create_dir_all
+            while let Some(parent) = parent_opt {
+                if parent.file_name().is_none() {
+                    break;
+                }
+                if fs::File::open(parent).and_then(|f| f.sync_all()).is_err() {
+                    // we made a reasonable attempt, but permissions
+                    // can sometimes get in the way, and at this point it's
+                    // becoming pedantic.
+                    break;
+                }
+                parent_opt = parent.parent();
+            }
         }
 
         let log = fs::OpenOptions::new()
@@ -393,6 +430,13 @@ impl<const K: usize, const V: usize> Lsm<K, V> {
         Ok(lsm)
     }
 
+    /// Writes a KV pair into the LSM Log, returning the
+    /// previous value if it existed. This operation might
+    /// involve blocking for a very brief moment as a 32kb
+    /// `BufWriter` wrapping the log file is flushed.
+    ///
+    /// If you require blocking until all written data is
+    /// durable, use the `Lsm::flush` method below.
     pub fn insert(&mut self, k: [u8; K], v: [u8; V]) -> Result<Option<[u8; V]>> {
         let crc: u32 = hash(&k, &v);
         self.log.write(&crc.to_le_bytes())?;
@@ -410,8 +454,17 @@ impl<const K: usize, const V: usize> Lsm<K, V> {
         Ok(self.db.insert(k, v))
     }
 
+    /// Blocks until all log data has been
+    /// written out to disk and fsynced. If
+    /// the log file has grown above a certain
+    /// threshold, it will be compacted into
+    /// a new sstable and the log file will
+    /// be truncated after the sstable has
+    /// been written, fsynced, and the sstable
+    /// directory has been fsyced.
     pub fn flush(&mut self) -> Result<()> {
         self.log.flush()?;
+        self.log.get_mut().sync_all()?;
 
         if self.dirty_bytes > LOG_COMPACT_BYTES {
             log::debug!("flushing log");
