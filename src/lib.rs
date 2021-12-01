@@ -62,12 +62,47 @@ use std::io::{self, prelude::*, BufReader, BufWriter, Result};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc;
 
-const MAX_SPACE_AMP: u64 = 2;
-const LOG_COMPACT_BYTES: usize = 32 * 1024 * 1024;
-const MERGE_RATIO: u64 = 3;
-const MERGE_WINDOW: usize = 10;
 const SSTABLE_DIR: &str = "sstables";
-const LOG_BUFFER: usize = 32 * 1024;
+
+#[derive(Debug, Clone, Copy)]
+pub struct Config {
+    /// If on-disk uncompressed sstable data exceeds in-memory usage
+    /// by this proportion, a full-compaction of all sstables will
+    /// occur. This is only likely to happen in situations where
+    /// multiple versions of most of the database's keys exist
+    /// in multiple sstables, but should never happen for workloads
+    /// where mostly new keys are being written.
+    pub max_space_amp: u64,
+    /// When the log file exceeds this size, a new compressed
+    /// and compacted sstable will be flushed to disk and the
+    /// log file will be truncated.
+    pub max_log_length: usize,
+    /// When the background compactor thread looks for contiguous
+    /// ranges of sstables to merge, it will require all sstables
+    /// to be at least 1/`merge_ratio` * the size of the first sstable
+    /// in the contiguous window under consideration.
+    pub merge_ratio: u64,
+    /// When the background compactor thread looks for ranges of
+    /// sstables to merge, it will require ranges to be at least
+    /// this long.
+    pub merge_window: usize,
+    /// All inserts go directly to a `BufWriter` wrapping the log
+    /// file. This option determines how large that in-memory buffer
+    /// is.
+    pub log_bufwriter_size: usize,
+}
+
+impl Default for Config {
+    fn default() -> Config {
+        Config {
+            max_space_amp: 2,
+            max_log_length: 32 * 1024 * 1024,
+            merge_ratio: 3,
+            merge_window: 10,
+            log_bufwriter_size: 32 * 1024,
+        }
+    }
+}
 
 fn hash<const K: usize, const V: usize>(k: &[u8; K], v: &[u8; V]) -> u32 {
     let mut hasher = crc32fast::Hasher::new();
@@ -88,6 +123,7 @@ struct Worker<const K: usize, const V: usize> {
     inbox: mpsc::Receiver<WorkerMessage>,
     db_sz: u64,
     path: PathBuf,
+    config: Config,
 }
 
 impl<const K: usize, const V: usize> Worker<K, V> {
@@ -123,11 +159,11 @@ impl<const K: usize, const V: usize> Worker<K, V> {
         let on_disk_size: u64 = self.sstable_directory.values().sum();
 
         log::debug!("disk size: {} mem size: {}", on_disk_size, self.db_sz);
-        if on_disk_size / self.db_sz > MAX_SPACE_AMP {
+        if on_disk_size / self.db_sz > self.config.max_space_amp {
             log::info!(
                 "performing full compaction, decompressed on-disk \
                 database size has grown beyond {}x the in-memory size",
-                MAX_SPACE_AMP
+                self.config.max_space_amp
             );
             let run_to_compact: Vec<u64> = self.sstable_directory.keys().copied().collect();
 
@@ -135,7 +171,7 @@ impl<const K: usize, const V: usize> Worker<K, V> {
             return Ok(true);
         }
 
-        if self.sstable_directory.len() < MERGE_WINDOW {
+        if self.sstable_directory.len() < self.config.merge_window {
             return Ok(false);
         }
 
@@ -143,12 +179,12 @@ impl<const K: usize, const V: usize> Worker<K, V> {
             .sstable_directory
             .iter()
             .collect::<Vec<_>>()
-            .windows(MERGE_WINDOW)
+            .windows(self.config.merge_window)
         {
             if window
                 .iter()
                 .skip(1)
-                .all(|w| *w.1 * MERGE_RATIO > *window[0].1)
+                .all(|w| *w.1 * self.config.merge_ratio > *window[0].1)
             {
                 let run_to_compact: Vec<u64> = window.into_iter().map(|(id, _sum)| **id).collect();
 
@@ -303,7 +339,7 @@ fn read_sstable<const K: usize, const V: usize>(
     if sstable.len() as u64 != expected_len {
         log::warn!(
             "sstable {:016x} tear detected - process probably crashed \
-                  before full sstable could be written out",
+            before full sstable could be written out",
             id
         );
     }
@@ -319,6 +355,7 @@ pub struct Lsm<const K: usize, const V: usize> {
     next_sstable_id: u64,
     dirty_bytes: usize,
     path: PathBuf,
+    config: Config,
 }
 
 impl<const K: usize, const V: usize> std::ops::Deref for Lsm<K, V> {
@@ -338,6 +375,14 @@ impl<const K: usize, const V: usize> Lsm<K, V> {
     /// all previously written sstables and the log,
     /// to recover all data into an in-memory `BTreeMap`.
     pub fn recover<P: AsRef<Path>>(p: P) -> Result<Lsm<K, V>> {
+        Lsm::recover_with_config(p, Config::default())
+    }
+
+    /// Recover the LSM, and provide custom options
+    /// around IO and merging. All values in the `Config`
+    /// object are safe to change across restarts, unlike
+    /// the fixed K and V lengths for data in the database.
+    pub fn recover_with_config<P: AsRef<Path>>(p: P, config: Config) -> Result<Lsm<K, V>> {
         let path = p.as_ref();
         if !path.exists() {
             fs::create_dir_all(path)?;
@@ -413,18 +458,20 @@ impl<const K: usize, const V: usize> Lsm<K, V> {
             sstable_directory,
             inbox: rx,
             db_sz: db.len() as u64 * (K + V) as u64,
+            config,
         };
 
         std::thread::spawn(move || worker.run());
 
         let lsm = Lsm {
-            log: BufWriter::with_capacity(LOG_BUFFER, reader.into_inner()),
+            log: BufWriter::with_capacity(config.log_bufwriter_size, reader.into_inner()),
             memtable: BTreeMap::new(),
             db,
             path: path.into(),
             next_sstable_id: max_sstable_id.unwrap_or(0) + 1,
             dirty_bytes: recovered as usize,
             worker_outbox: tx,
+            config,
         };
 
         Ok(lsm)
@@ -447,7 +494,7 @@ impl<const K: usize, const V: usize> Lsm<K, V> {
 
         self.dirty_bytes += 4 + K + V;
 
-        if self.dirty_bytes > LOG_COMPACT_BYTES {
+        if self.dirty_bytes > self.config.max_log_length {
             self.flush()?;
         }
 
@@ -466,7 +513,7 @@ impl<const K: usize, const V: usize> Lsm<K, V> {
         self.log.flush()?;
         self.log.get_mut().sync_all()?;
 
-        if self.dirty_bytes > LOG_COMPACT_BYTES {
+        if self.dirty_bytes > self.config.max_log_length {
             log::debug!("flushing log");
             self.log.get_mut().sync_all()?;
             let memtable = std::mem::take(&mut self.memtable);

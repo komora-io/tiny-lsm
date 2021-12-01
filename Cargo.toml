@@ -1,6 +1,6 @@
 [package]
 name = "tiny-lsm"
-version = "0.1.2"
+version = "0.1.3"
 edition = "2021"
 authors = ["Tyler Neely <t@jujit.su>"]
 description = "a dead-simple in-memory blocking LSM tree for constant-sized keys and values"
