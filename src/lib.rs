@@ -204,16 +204,16 @@ impl<const K: usize, const V: usize> Worker<K, V> {
                 .map(|id| id_format(*id))
                 .collect::<Vec<_>>()
         );
-        let mut sstable_data = vec![];
+
+        let mut map = BTreeMap::new();
 
         for sstable_id in sstable_ids {
-            let mut sstable = read_sstable::<K, V>(&self.path, *sstable_id)?;
-            sstable_data.append(&mut sstable);
+            for (k, v) in read_sstable::<K, V>(&self.path, *sstable_id)? {
+                map.insert(k, v);
+            }
         }
 
         let sst_id = sstable_ids.iter().max().unwrap();
-
-        let map = sstable_data.into_iter().collect();
 
         write_sstable(&self.path, *sst_id, &map, true)?;
 
@@ -311,7 +311,7 @@ fn read_sstable<const K: usize, const V: usize>(
         .read(true)
         .open(path.join(SSTABLE_DIR).join(id_format(id)))?;
 
-    let mut reader = BufReader::with_capacity(128 * 1024 * 1024, zstd::Decoder::new(file).unwrap());
+    let mut reader = zstd::Decoder::new(BufReader::with_capacity(16 * 1024 * 1024, file)).unwrap();
 
     let mut buf = vec![0; 4 + K + V];
 
@@ -416,12 +416,12 @@ impl<const K: usize, const V: usize> Lsm<K, V> {
         let sstable_directory = list_sstables(path)?;
         let mut sstables: Vec<u64> = sstable_directory.iter().map(|(id, _sz)| *id).collect();
 
-        let mut sstable_data = vec![];
+        let mut db = BTreeMap::new();
         for sstable_id in &sstables {
-            let mut sstable = read_sstable::<K, V>(path, *sstable_id)?;
-            sstable_data.append(&mut sstable);
+            for (k, v) in read_sstable::<K, V>(path, *sstable_id)? {
+                db.insert(k, v);
+            }
         }
-        let mut db: BTreeMap<_, _> = sstable_data.into_iter().collect();
 
         let max_sstable_id = sstables.pop();
 
