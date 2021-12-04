@@ -200,7 +200,7 @@ impl<const K: usize, const V: usize> Worker<K, V> {
 
         log::debug!("disk size: {} mem size: {}", on_disk_size, self.db_sz);
         if self.sstable_directory.len() > 1
-            && on_disk_size / self.db_sz + 1 > self.config.max_space_amp
+            && on_disk_size / (self.db_sz + 1) > self.config.max_space_amp
         {
             log::info!(
                 "performing full compaction, decompressed on-disk \
