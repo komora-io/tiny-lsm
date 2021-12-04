@@ -1,3 +1,4 @@
 tiny_lsm_bench
 target
 Cargo.lock
+fuzz*
