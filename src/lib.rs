@@ -141,7 +141,6 @@ struct Worker<const K: usize, const V: usize> {
 impl<const K: usize, const V: usize> Worker<K, V> {
     fn run(mut self) {
         loop {
-            /*
             match self.inbox.try_recv() {
                 Ok(WorkerMessage::NewSST { id, sst_sz, db_sz }) => {
                     self.db_sz = db_sz;
@@ -167,7 +166,6 @@ impl<const K: usize, const V: usize> Worker<K, V> {
                     return;
                 }
             }
-            */
 
             // no work to do, wait for new sstables
             match self.inbox.recv() {
