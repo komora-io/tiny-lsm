@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, Serialize, Deserialize, fuzzcheck::DefaultMutator)]
 enum Operation {
     Insert(u8, u8),
-    //Remove(u8),
+    Remove(u8),
     //Contains(u8),
     Restart,
 }
@@ -19,11 +19,12 @@ fn compare_with_btree_map(operations: &[Operation]) {
     let _ = std::fs::remove_dir_all(&path);
 
     let config = crate::Config {
-        max_space_amp: 1,
+        max_space_amp: 2,
         max_log_length: 6,
         merge_ratio: 5,
         merge_window: 3,
         log_bufwriter_size: 1024,
+        zstd_sstable_compression_level: 1,
     };
 
     let _ = std::fs::remove_dir_all(&path);
@@ -41,12 +42,12 @@ fn compare_with_btree_map(operations: &[Operation]) {
                 let b = map.insert([*key], [*value]);
                 assert_eq!(a, b);
             }
-            /*
             Operation::Remove(key) => {
                 let a = lsm.remove(&[*key]).unwrap();
                 let b = map.remove(&[*key]);
                 assert_eq!(a, b);
             }
+            /*
             Operation::Contains(key) => {
                 let a = lsm.contains_key(&[*key]);
                 let b = map.contains_key(&[*key]);

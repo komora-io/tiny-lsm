@@ -95,6 +95,8 @@ pub struct Config {
     /// file. This option determines how large that in-memory buffer
     /// is.
     pub log_bufwriter_size: usize,
+    /// The level of compression to use for the sstables with zstd.
+    pub zstd_sstable_compression_level: u8,
 }
 
 impl Default for Config {
@@ -105,6 +107,7 @@ impl Default for Config {
             merge_ratio: 3,
             merge_window: 10,
             log_bufwriter_size: 32 * 1024,
+            zstd_sstable_compression_level: 3,
         }
     }
 }
@@ -128,6 +131,7 @@ fn hash<const K: usize, const V: usize>(k: &[u8; K], v: &Option<[u8; V]>) -> u32
 enum WorkerMessage {
     NewSST { id: u64, sst_sz: u64, db_sz: u64 },
     Stop(mpsc::Sender<()>),
+    Heartbeat(mpsc::Sender<()>),
 }
 
 struct Worker<const K: usize, const V: usize> {
@@ -150,6 +154,9 @@ impl<const K: usize, const V: usize> Worker<K, V> {
                     drop(dropper);
                     return;
                 }
+                Ok(WorkerMessage::Heartbeat(dropper)) => {
+                    drop(dropper);
+                }
                 Err(mpsc::TryRecvError::Empty) => {}
                 Err(mpsc::TryRecvError::Disconnected) => {
                     log::info!("tiny-lsm compaction worker quitting");
@@ -163,7 +170,6 @@ impl<const K: usize, const V: usize> Worker<K, V> {
                 Ok(true) => continue,
                 Err(e) => {
                     log::error!("error while compacting sstables in the background: {:?}", e);
-                    return;
                 }
             }
 
@@ -178,6 +184,9 @@ impl<const K: usize, const V: usize> Worker<K, V> {
                     log::info!("tiny-lsm compaction worker quitting");
                     return;
                 }
+                Ok(WorkerMessage::Heartbeat(dropper)) => {
+                    drop(dropper);
+                }
                 Err(mpsc::RecvError) => {
                     log::info!("tiny-lsm compaction worker quitting");
                     return;
@@ -190,7 +199,8 @@ impl<const K: usize, const V: usize> Worker<K, V> {
         let on_disk_size: u64 = self.sstable_directory.values().sum();
 
         log::debug!("disk size: {} mem size: {}", on_disk_size, self.db_sz);
-        if on_disk_size / self.db_sz > self.config.max_space_amp {
+        if self.sstable_directory.len() > 1 && on_disk_size / self.db_sz > self.config.max_space_amp
+        {
             log::info!(
                 "performing full compaction, decompressed on-disk \
                 database size has grown beyond {}x the in-memory size",
@@ -244,9 +254,12 @@ impl<const K: usize, const V: usize> Worker<K, V> {
             }
         }
 
-        let sst_id = sstable_ids.iter().max().unwrap();
+        let sst_id = sstable_ids
+            .iter()
+            .max()
+            .expect("compact_sstable_run called with empty set of sst ids");
 
-        write_sstable(&self.path, *sst_id, &map, true)?;
+        write_sstable(&self.path, *sst_id, &map, true, &self.config)?;
 
         let sst_sz = map.len() as u64 * (4 + K + V) as u64;
         self.sstable_directory.insert(*sst_id, sst_sz);
@@ -258,7 +271,9 @@ impl<const K: usize, const V: usize> Worker<K, V> {
                 continue;
             }
             fs::remove_file(self.path.join(SSTABLE_DIR).join(id_format(*sstable_id)))?;
-            self.sstable_directory.remove(sstable_id).unwrap();
+            self.sstable_directory
+                .remove(sstable_id)
+                .expect("compacted sst not present in sstable_directory");
         }
 
         fs::File::open(self.path.join(SSTABLE_DIR))?.sync_all()?;
@@ -276,7 +291,12 @@ fn list_sstables(path: &Path) -> Result<BTreeMap<u64, u64>> {
 
     for dir_entry_res in fs::read_dir(path.join(SSTABLE_DIR))? {
         let dir_entry = dir_entry_res?;
-        let file_name = dir_entry.file_name().into_string().unwrap();
+        let file_name = if let Ok(f) = dir_entry.file_name().into_string() {
+            f
+        } else {
+            continue;
+        };
+
         if let Ok(id) = u64::from_str_radix(&file_name, 16) {
             let metadata = dir_entry.metadata()?;
 
@@ -297,6 +317,7 @@ fn write_sstable<const K: usize, const V: usize>(
     id: u64,
     items: &BTreeMap<[u8; K], Option<[u8; V]>>,
     tmp_mv: bool,
+    config: &Config,
 ) -> Result<()> {
     let sst_dir_path = path.join(SSTABLE_DIR);
     let sst_path = if tmp_mv {
@@ -310,7 +331,10 @@ fn write_sstable<const K: usize, const V: usize>(
         .write(true)
         .open(&sst_path)?;
 
-    let mut bw = BufWriter::new(zstd::Encoder::new(file, 3).unwrap());
+    let mut bw = BufWriter::new(
+        zstd::Encoder::new(file, config.zstd_sstable_compression_level as _)
+            .expect("zstd encoder failure"),
+    );
 
     bw.write(&(items.len() as u64).to_le_bytes())?;
 
@@ -557,6 +581,9 @@ impl<const K: usize, const V: usize> Lsm<K, V> {
         };
 
         std::thread::spawn(move || worker.run());
+        let (hb_tx, hb_rx) = mpsc::channel();
+        tx.send(WorkerMessage::Heartbeat(hb_tx)).unwrap();
+        for _ in hb_rx {}
 
         let lsm = Lsm {
             log: BufWriter::with_capacity(config.log_bufwriter_size, reader.into_inner()),
@@ -636,9 +663,10 @@ impl<const K: usize, const V: usize> Lsm<K, V> {
             log::debug!("flushing log");
             let memtable = std::mem::take(&mut self.memtable);
             let sst_id = self.next_sstable_id;
-            if let Err(e) = write_sstable(&self.path, sst_id, &memtable, false) {
+            if let Err(e) = write_sstable(&self.path, sst_id, &memtable, false, &self.config) {
                 // put memtable back together before returning
                 self.memtable = memtable;
+                log::error!("failed to flush lsm log to sst: {:?}", e);
                 return Err(e.into());
             }
 
