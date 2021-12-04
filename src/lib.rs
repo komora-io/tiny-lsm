@@ -55,6 +55,7 @@
 //! assert_eq!(lsm.get(&key), Some(&value));
 //!
 //! ```
+#![cfg_attr(test, feature(no_coverage))]
 
 use std::collections::BTreeMap;
 use std::fs;
@@ -65,6 +66,10 @@ use std::sync::mpsc;
 const SSTABLE_DIR: &str = "sstables";
 
 #[derive(Debug, Clone, Copy)]
+#[cfg_attr(
+    test,
+    derive(serde::Serialize, serde::Deserialize, fuzzcheck::DefaultMutator)
+)]
 pub struct Config {
     /// If on-disk uncompressed sstable data exceeds in-memory usage
     /// by this proportion, a full-compaction of all sstables will
@@ -104,10 +109,16 @@ impl Default for Config {
     }
 }
 
-fn hash<const K: usize, const V: usize>(k: &[u8; K], v: &[u8; V]) -> u32 {
+fn hash<const K: usize, const V: usize>(k: &[u8; K], v: &Option<[u8; V]>) -> u32 {
     let mut hasher = crc32fast::Hasher::new();
+    hasher.update(&[v.is_some() as u8]);
     hasher.update(&*k);
-    hasher.update(&*v);
+
+    if let Some(v) = v {
+        hasher.update(v);
+    } else {
+        hasher.update(&[0; V]);
+    }
 
     // we XOR the hash to make sure it's something other than 0 when empty,
     // because 0 is an easy value to create accidentally or via corruption.
@@ -116,6 +127,7 @@ fn hash<const K: usize, const V: usize>(k: &[u8; K], v: &[u8; V]) -> u32 {
 
 enum WorkerMessage {
     NewSST { id: u64, sst_sz: u64, db_sz: u64 },
+    Stop(mpsc::Sender<()>),
 }
 
 struct Worker<const K: usize, const V: usize> {
@@ -129,27 +141,48 @@ struct Worker<const K: usize, const V: usize> {
 impl<const K: usize, const V: usize> Worker<K, V> {
     fn run(mut self) {
         loop {
-            let message = if let Ok(message) = self.inbox.recv() {
-                message
-            } else {
-                log::info!("tiny-lsm compaction worker quitting");
-                return;
+            /*
+            match self.inbox.try_recv() {
+                Ok(WorkerMessage::NewSST { id, sst_sz, db_sz }) => {
+                    self.db_sz = db_sz;
+                    self.sstable_directory.insert(id, sst_sz);
+                }
+                Ok(WorkerMessage::Stop(dropper)) => {
+                    drop(dropper);
+                    return;
+                }
+                Err(mpsc::TryRecvError::Empty) => {}
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    log::info!("tiny-lsm compaction worker quitting");
+                    return;
+                }
             };
 
-            let WorkerMessage::NewSST { id, sst_sz, db_sz } = message;
+            let res = self.sstable_maintenance();
+            match res {
+                Ok(false) => {}
+                Ok(true) => continue,
+                Err(e) => {
+                    log::error!("error while compacting sstables in the background: {:?}", e);
+                    return;
+                }
+            }
+            */
 
-            self.db_sz = db_sz;
-            self.sstable_directory.insert(id, sst_sz);
-
-            loop {
-                let res = self.sstable_maintenance();
-                match res {
-                    Ok(false) => break,
-                    Ok(true) => continue,
-                    Err(e) => {
-                        log::error!("error while compacting sstables in the background: {:?}", e);
-                        break;
-                    }
+            // no work to do, wait for new sstables
+            match self.inbox.recv() {
+                Ok(WorkerMessage::NewSST { id, sst_sz, db_sz }) => {
+                    self.db_sz = db_sz;
+                    self.sstable_directory.insert(id, sst_sz);
+                }
+                Ok(WorkerMessage::Stop(dropper)) => {
+                    drop(dropper);
+                    log::info!("tiny-lsm compaction worker quitting");
+                    return;
+                }
+                Err(mpsc::RecvError) => {
+                    log::info!("tiny-lsm compaction worker quitting");
+                    return;
                 }
             }
         }
@@ -264,7 +297,7 @@ fn list_sstables(path: &Path) -> Result<BTreeMap<u64, u64>> {
 fn write_sstable<const K: usize, const V: usize>(
     path: &Path,
     id: u64,
-    items: &BTreeMap<[u8; K], [u8; V]>,
+    items: &BTreeMap<[u8; K], Option<[u8; V]>>,
     tmp_mv: bool,
 ) -> Result<()> {
     let sst_dir_path = path.join(SSTABLE_DIR);
@@ -286,8 +319,14 @@ fn write_sstable<const K: usize, const V: usize>(
     for (k, v) in items {
         let crc: u32 = hash(k, v);
         bw.write(&crc.to_le_bytes())?;
+        bw.write(&[v.is_some() as u8])?;
         bw.write(k)?;
-        bw.write(v)?;
+
+        if let Some(v) = v {
+            bw.write(v)?;
+        } else {
+            bw.write(&[0; V])?;
+        }
     }
 
     bw.flush()?;
@@ -306,14 +345,15 @@ fn write_sstable<const K: usize, const V: usize>(
 fn read_sstable<const K: usize, const V: usize>(
     path: &Path,
     id: u64,
-) -> Result<Vec<([u8; K], [u8; V])>> {
+) -> Result<Vec<([u8; K], Option<[u8; V]>)>> {
     let file = fs::OpenOptions::new()
         .read(true)
         .open(path.join(SSTABLE_DIR).join(id_format(id)))?;
 
     let mut reader = zstd::Decoder::new(BufReader::with_capacity(16 * 1024 * 1024, file)).unwrap();
 
-    let mut buf = vec![0; 4 + K + V];
+    // crc + tombstone discriminant + key + value
+    let mut buf = vec![0; 4 + 1 + K + V];
 
     let len_buf = &mut [0; 8];
 
@@ -324,8 +364,20 @@ fn read_sstable<const K: usize, const V: usize>(
 
     while let Ok(()) = reader.read_exact(&mut buf) {
         let crc_expected: u32 = u32::from_le_bytes(buf[0..4].try_into().unwrap());
-        let k: [u8; K] = buf[4..K + 4].try_into().unwrap();
-        let v: [u8; V] = buf[K + 4..4 + K + V].try_into().unwrap();
+        let d: bool = match buf[4] {
+            0 => false,
+            1 => true,
+            _ => {
+                log::warn!("detected torn-write while reading sstable {:016x}", id);
+                break;
+            }
+        };
+        let k: [u8; K] = buf[5..K + 5].try_into().unwrap();
+        let v: Option<[u8; V]> = if d {
+            Some(buf[K + 5..5 + K + V].try_into().unwrap())
+        } else {
+            None
+        };
         let crc_actual: u32 = hash(&k, &v);
 
         if crc_expected != crc_actual {
@@ -348,14 +400,32 @@ fn read_sstable<const K: usize, const V: usize>(
 }
 
 pub struct Lsm<const K: usize, const V: usize> {
+    // `BufWriter` flushes on drop
     log: BufWriter<fs::File>,
-    memtable: BTreeMap<[u8; K], [u8; V]>,
+    memtable: BTreeMap<[u8; K], Option<[u8; V]>>,
     db: BTreeMap<[u8; K], [u8; V]>,
     worker_outbox: mpsc::Sender<WorkerMessage>,
     next_sstable_id: u64,
     dirty_bytes: usize,
     path: PathBuf,
     config: Config,
+}
+
+impl<const K: usize, const V: usize> Drop for Lsm<K, V> {
+    fn drop(&mut self) {
+        if let Err(e) = self.flush() {
+            log::error!("failed to flush while dropping Lsm: {:?}", e);
+        }
+
+        let (tx, rx) = mpsc::channel();
+
+        if self.worker_outbox.send(WorkerMessage::Stop(tx)).is_err() {
+            log::error!("failed to shut down compaction worker on Lsm drop");
+            return;
+        }
+
+        for _ in rx {}
+    }
 }
 
 impl<const K: usize, const V: usize> std::ops::Deref for Lsm<K, V> {
@@ -414,26 +484,47 @@ impl<const K: usize, const V: usize> Lsm<K, V> {
             .open(path.join("log"))?;
 
         let sstable_directory = list_sstables(path)?;
-        let mut sstables: Vec<u64> = sstable_directory.iter().map(|(id, _sz)| *id).collect();
 
         let mut db = BTreeMap::new();
-        for sstable_id in &sstables {
+        for sstable_id in sstable_directory.keys() {
             for (k, v) in read_sstable::<K, V>(path, *sstable_id)? {
-                db.insert(k, v);
+                if let Some(v) = v {
+                    db.insert(k, v);
+                } else {
+                    db.remove(&k);
+                }
             }
         }
 
-        let max_sstable_id = sstables.pop();
+        let max_sstable_id = sstable_directory.keys().next_back().copied();
 
         let mut reader = BufReader::new(log);
 
-        let mut buf = vec![0; 4 + K + V];
+        let mut buf = vec![0; 5 + K + V];
 
+        let mut memtable = BTreeMap::new();
         let mut recovered = 0;
         while let Ok(()) = reader.read_exact(&mut buf) {
             let crc_expected: u32 = u32::from_le_bytes(buf[0..4].try_into().unwrap());
-            let k: [u8; K] = buf[4..K + 4].try_into().unwrap();
-            let v: [u8; V] = buf[K + 4..4 + K + V].try_into().unwrap();
+            let d: bool = match buf[4] {
+                0 => false,
+                1 => true,
+                _ => {
+                    // need to back up a few bytes to chop off the torn log
+                    let log_file = reader.get_mut();
+                    log_file.seek(io::SeekFrom::Start(recovered))?;
+                    log_file.set_len(recovered)?;
+                    log_file.sync_all()?;
+                    fs::File::open(path.join(SSTABLE_DIR))?.sync_all()?;
+                    break;
+                }
+            };
+            let k: [u8; K] = buf[5..K + 5].try_into().unwrap();
+            let v: Option<[u8; V]> = if d {
+                Some(buf[K + 5..5 + K + V].try_into().unwrap())
+            } else {
+                None
+            };
             let crc_actual: u32 = hash(&k, &v);
 
             if crc_expected != crc_actual {
@@ -448,7 +539,13 @@ impl<const K: usize, const V: usize> Lsm<K, V> {
 
             recovered += buf.len() as u64;
 
-            db.insert(k, v);
+            memtable.insert(k, v);
+
+            if let Some(v) = v {
+                db.insert(k, v);
+            } else {
+                db.remove(&k);
+            }
         }
 
         let (tx, rx) = mpsc::channel();
@@ -465,7 +562,7 @@ impl<const K: usize, const V: usize> Lsm<K, V> {
 
         let lsm = Lsm {
             log: BufWriter::with_capacity(config.log_bufwriter_size, reader.into_inner()),
-            memtable: BTreeMap::new(),
+            memtable,
             db,
             path: path.into(),
             next_sstable_id: max_sstable_id.unwrap_or(0) + 1,
@@ -477,7 +574,7 @@ impl<const K: usize, const V: usize> Lsm<K, V> {
         Ok(lsm)
     }
 
-    /// Writes a KV pair into the LSM Log, returning the
+    /// Writes a KV pair into the `Lsm`, returning the
     /// previous value if it existed. This operation might
     /// involve blocking for a very brief moment as a 32kb
     /// `BufWriter` wrapping the log file is flushed.
@@ -485,10 +582,34 @@ impl<const K: usize, const V: usize> Lsm<K, V> {
     /// If you require blocking until all written data is
     /// durable, use the `Lsm::flush` method below.
     pub fn insert(&mut self, k: [u8; K], v: [u8; V]) -> Result<Option<[u8; V]>> {
+        assert_ne!([k[0], v[0]], [255, 254]);
+        self.log_mutation(k, Some(v))?;
+        Ok(self.db.insert(k, v))
+    }
+
+    /// Removes a KV pair from the `Lsm`, returning the
+    /// previous value if it existed. This operation might
+    /// involve blocking for a very brief moment as a 32kb
+    /// `BufWriter` wrapping the log file is flushed.
+    ///
+    /// If you require blocking until all written data is
+    /// durable, use the `Lsm::flush` method below.
+    pub fn remove(&mut self, k: &[u8; K]) -> Result<Option<[u8; V]>> {
+        self.log_mutation(*k, None)?;
+        Ok(self.db.remove(k))
+    }
+
+    fn log_mutation(&mut self, k: [u8; K], v: Option<[u8; V]>) -> Result<()> {
         let crc: u32 = hash(&k, &v);
         self.log.write(&crc.to_le_bytes())?;
+        self.log.write(&[v.is_some() as u8])?;
         self.log.write(&k)?;
-        self.log.write(&v)?;
+
+        if let Some(v) = v {
+            self.log.write(&v)?;
+        } else {
+            self.log.write(&[0; V])?;
+        };
 
         self.memtable.insert(k, v);
 
@@ -498,7 +619,7 @@ impl<const K: usize, const V: usize> Lsm<K, V> {
             self.flush()?;
         }
 
-        Ok(self.db.insert(k, v))
+        Ok(())
     }
 
     /// Blocks until all log data has been
@@ -550,3 +671,6 @@ impl<const K: usize, const V: usize> Lsm<K, V> {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod tests;
