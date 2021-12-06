@@ -14,8 +14,9 @@ fn main() {
         lsm.insert(i.to_le_bytes(), [0; 8]).unwrap();
         if i % 1_000_000 == 0 {
             println!(
-                "{:.2} million wps",
-                i as f64 / (before_writes.elapsed().as_micros() + 1) as f64
+                "{:.2} million wps - stats: {:?}",
+                i as f64 / (before_writes.elapsed().as_micros() + 1) as f64,
+                lsm.stats(),
             )
         }
     }

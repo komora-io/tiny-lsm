@@ -61,7 +61,10 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::io::{self, prelude::*, BufReader, BufWriter, Result};
 use std::path::{Path, PathBuf};
-use std::sync::mpsc;
+use std::sync::{
+    atomic::{AtomicU64, Ordering},
+    mpsc, Arc,
+};
 
 const SSTABLE_DIR: &str = "sstables";
 
@@ -110,6 +113,22 @@ impl Default for Config {
             zstd_sstable_compression_level: 3,
         }
     }
+}
+
+struct WorkerStats {
+    read_bytes: AtomicU64,
+    written_bytes: AtomicU64,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct Stats {
+    resident_bytes: u64,
+    on_disk_bytes: u64,
+    logged_bytes: u64,
+    written_bytes: u64,
+    read_bytes: u64,
+    space_amp: f64,
+    write_amp: f64,
 }
 
 fn hash<const K: usize, const V: usize>(k: &[u8; K], v: &Option<[u8; V]>) -> u32 {
@@ -253,11 +272,18 @@ impl<const K: usize, const V: usize> Worker<K, V> {
 
         let mut map = BTreeMap::new();
 
+        let mut read_pairs = 0;
+
         for sstable_id in sstable_ids {
             for (k, v) in read_sstable::<K, V>(&self.path, *sstable_id)? {
                 map.insert(k, v);
+                read_pairs += 1;
             }
         }
+
+        self.stats
+            .read_bytes
+            .fetch_add(read_pairs * (4 + 1 + K + V) as u64, Ordering::Relaxed);
 
         let sst_id = sstable_ids
             .iter()
@@ -265,6 +291,10 @@ impl<const K: usize, const V: usize> Worker<K, V> {
             .expect("compact_sstable_run called with empty set of sst ids");
 
         write_sstable(&self.path, *sst_id, &map, true, &self.config)?;
+
+        self.stats
+            .written_bytes
+            .fetch_add(map.len() as u64 * (4 + 1 + K + V) as u64, Ordering::Relaxed);
 
         let sst_sz = map.len() as u64 * (4 + K + V) as u64;
         self.sstable_directory.insert(*sst_id, sst_sz);
@@ -291,7 +321,7 @@ fn id_format(id: u64) -> String {
     format!("{:016x}", id)
 }
 
-fn list_sstables(path: &Path) -> Result<BTreeMap<u64, u64>> {
+fn list_sstables(path: &Path, remove_tmp: bool) -> Result<BTreeMap<u64, u64>> {
     let mut sstable_map = BTreeMap::new();
 
     for dir_entry_res in fs::read_dir(path.join(SSTABLE_DIR))? {
@@ -307,7 +337,7 @@ fn list_sstables(path: &Path) -> Result<BTreeMap<u64, u64>> {
 
             sstable_map.insert(id, metadata.len());
         } else {
-            if file_name.ends_with("-tmp") {
+            if remove_tmp && file_name.ends_with("-tmp") {
                 log::warn!("removing incomplete sstable rewrite {}", file_name);
                 fs::remove_file(path.join(SSTABLE_DIR).join(file_name))?;
             }
@@ -428,14 +458,16 @@ fn read_sstable<const K: usize, const V: usize>(
 
 pub struct Lsm<const K: usize, const V: usize> {
     // `BufWriter` flushes on drop
-    log: BufWriter<fs::File>,
     memtable: BTreeMap<[u8; K], Option<[u8; V]>>,
     db: BTreeMap<[u8; K], [u8; V]>,
     worker_outbox: mpsc::Sender<WorkerMessage>,
     next_sstable_id: u64,
     dirty_bytes: usize,
+    log: BufWriter<fs::File>,
     path: PathBuf,
     config: Config,
+    stats: Stats,
+    worker_stats: Arc<WorkerStats>,
 }
 
 impl<const K: usize, const V: usize> Drop for Lsm<K, V> {
@@ -506,7 +538,7 @@ impl<const K: usize, const V: usize> Lsm<K, V> {
             .write(true)
             .open(path.join("log"))?;
 
-        let sstable_directory = list_sstables(path)?;
+        let sstable_directory = list_sstables(path, true)?;
 
         let mut db = BTreeMap::new();
         for sstable_id in sstable_directory.keys() {
@@ -573,12 +605,18 @@ impl<const K: usize, const V: usize> Lsm<K, V> {
 
         let (tx, rx) = mpsc::channel();
 
+        let worker_stats = Arc::new(WorkerStats {
+            read_bytes: 0.into(),
+            written_bytes: 0.into(),
+        });
+
         let worker: Worker<K, V> = Worker {
             path: path.clone().into(),
             sstable_directory,
             inbox: rx,
             db_sz: db.len() as u64 * (K + V) as u64,
             config,
+            stats: worker_stats.clone(),
         };
 
         std::thread::spawn(move || worker.run());
@@ -588,13 +626,23 @@ impl<const K: usize, const V: usize> Lsm<K, V> {
 
         let lsm = Lsm {
             log: BufWriter::with_capacity(config.log_bufwriter_size, reader.into_inner()),
-            memtable,
-            db,
             path: path.into(),
             next_sstable_id: max_sstable_id.unwrap_or(0) + 1,
             dirty_bytes: recovered as usize,
             worker_outbox: tx,
             config,
+            stats: Stats {
+                logged_bytes: recovered,
+                on_disk_bytes: 0,
+                read_bytes: 0,
+                written_bytes: 0,
+                resident_bytes: db.len() as u64 * (K + V) as u64,
+                space_amp: 0.,
+                write_amp: 0.,
+            },
+            worker_stats,
+            db,
+            memtable,
         };
 
         Ok(lsm)
@@ -637,9 +685,13 @@ impl<const K: usize, const V: usize> Lsm<K, V> {
             self.log.write(&[0; V])?;
         };
 
+        let logged_bytes = 4 + 1 + K + V;
+
         self.memtable.insert(k, v);
 
-        self.dirty_bytes += 4 + K + V;
+        self.dirty_bytes += logged_bytes;
+        self.stats.logged_bytes += logged_bytes as u64;
+        self.stats.written_bytes += logged_bytes as u64;
 
         if self.dirty_bytes > self.config.max_log_length {
             self.flush()?;
@@ -680,6 +732,7 @@ impl<const K: usize, const V: usize> Lsm<K, V> {
                 db_sz,
             }) {
                 log::error!("failed to send message to worker: {:?}", e);
+                log::logger().flush();
                 panic!("failed to send message to worker: {:?}", e);
             }
 
@@ -697,6 +750,27 @@ impl<const K: usize, const V: usize> Lsm<K, V> {
         }
 
         Ok(())
+    }
+
+    pub fn stats(&mut self) -> Result<Stats> {
+        self.stats.written_bytes += self.worker_stats.written_bytes.swap(0, Ordering::Relaxed);
+        self.stats.read_bytes += self.worker_stats.read_bytes.swap(0, Ordering::Relaxed);
+        self.stats.resident_bytes = self.db.len() as u64 * (K + V) as u64;
+
+        let mut on_disk_bytes: u64 = std::fs::metadata(self.path.join("log"))?.len();
+
+        on_disk_bytes += list_sstables(&self.path, false)?
+            .into_iter()
+            .map(|(_, len)| len)
+            .sum::<u64>();
+
+        self.stats.on_disk_bytes = on_disk_bytes;
+
+        self.stats.write_amp =
+            self.stats.written_bytes as f64 / self.stats.on_disk_bytes.max(1) as f64;
+        self.stats.space_amp =
+            self.stats.on_disk_bytes as f64 / self.stats.resident_bytes.max(1) as f64;
+        Ok(self.stats)
     }
 }
 
