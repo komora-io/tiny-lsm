@@ -9,11 +9,11 @@ repository = "https://github.com/spacejam/tiny-lsm"
 documentation = "https://docs.rs/tiny-lsm/"
 
 [dependencies]
-crc32fast = "1.2.2"
+crc32fast = "1.3.0"
 zstd = "0.9.0"
 log = "0.4.14"
 
 [dev-dependencies]
-fuzzcheck = "0.9"
-serde = { version = "1.0", features = ["derive"] }
+fuzzcheck = "0.10.1"
+serde = { version = "1.0.130", features = ["derive"] }
 serde_json = "1.0.72"

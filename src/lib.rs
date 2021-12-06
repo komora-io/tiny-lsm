@@ -238,6 +238,10 @@ impl<const K: usize, const V: usize> Worker<K, V> {
         Ok(false)
     }
 
+    // This function must be able to crash at any point without
+    // leaving the system in an unrecoverable state, or without
+    // losing data. This function must be nullipotent from the
+    // external API surface's perspective.
     fn compact_sstable_run(&mut self, sstable_ids: &[u64]) -> Result<()> {
         log::debug!(
             "trying to compact sstable_ids {:?}",
@@ -661,13 +665,13 @@ impl<const K: usize, const V: usize> Lsm<K, V> {
         self.log.get_mut().sync_all()?;
 
         if self.dirty_bytes > self.config.max_log_length {
-            log::debug!("flushing log");
+            log::debug!("compacting log to sstable");
             let memtable = std::mem::take(&mut self.memtable);
             let sst_id = self.next_sstable_id;
             if let Err(e) = write_sstable(&self.path, sst_id, &memtable, false, &self.config) {
                 // put memtable back together before returning
                 self.memtable = memtable;
-                log::error!("failed to flush lsm log to sst: {:?}", e);
+                log::error!("failed to flush lsm log to sstable: {:?}", e);
                 return Err(e.into());
             }
 
