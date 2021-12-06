@@ -358,18 +358,18 @@ fn write_sstable<const K: usize, const V: usize>(
             .expect("zstd encoder failure"),
     );
 
-    bw.write(&(items.len() as u64).to_le_bytes())?;
+    bw.write_all(&(items.len() as u64).to_le_bytes())?;
 
     for (k, v) in items {
         let crc: u32 = hash(k, v);
-        bw.write(&crc.to_le_bytes())?;
-        bw.write(&[v.is_some() as u8])?;
-        bw.write(k)?;
+        bw.write_all(&crc.to_le_bytes())?;
+        bw.write_all(&[v.is_some() as u8])?;
+        bw.write_all(k)?;
 
         if let Some(v) = v {
-            bw.write(v)?;
+            bw.write_all(v)?;
         } else {
-            bw.write(&[0; V])?;
+            bw.write_all(&[0; V])?;
         }
     }
 
@@ -662,14 +662,14 @@ impl<const K: usize, const V: usize> Lsm<K, V> {
 
     fn log_mutation(&mut self, k: [u8; K], v: Option<[u8; V]>) -> Result<()> {
         let crc: u32 = hash(&k, &v);
-        self.log.write(&crc.to_le_bytes())?;
-        self.log.write(&[v.is_some() as u8])?;
-        self.log.write(&k)?;
+        self.log.write_all(&crc.to_le_bytes())?;
+        self.log.write_all(&[v.is_some() as u8])?;
+        self.log.write_all(&k)?;
 
         if let Some(v) = v {
-            self.log.write(&v)?;
+            self.log.write_all(&v)?;
         } else {
-            self.log.write(&[0; V])?;
+            self.log.write_all(&[0; V])?;
         };
 
         let logged_bytes = 4 + 1 + K + V;
