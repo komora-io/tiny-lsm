@@ -15,7 +15,10 @@ enum Operation {
 fn compare_with_btree_map(operations: &[Operation]) {
     static NDB: AtomicUsize = AtomicUsize::new(0);
 
-    let path = format!("fuzzcheck-test-{}", NDB.fetch_add(1, Ordering::SeqCst));
+    let path = format!(
+        "test_db/fuzzcheck-test-{}",
+        NDB.fetch_add(1, Ordering::SeqCst)
+    );
     let _ = std::fs::remove_dir_all(&path);
 
     let config = crate::Config {
@@ -55,6 +58,7 @@ fn compare_with_btree_map(operations: &[Operation]) {
             }
             */
             Operation::Restart => {
+                lsm.flush().unwrap();
                 drop(lsm);
                 lsm = crate::Lsm::recover_with_config(&path, config).unwrap();
             }
@@ -73,7 +77,9 @@ fn compare_with_btree_map(operations: &[Operation]) {
 }
 
 #[test]
-fn fuzz_test_tree() {
+fn fuzz() {
+    //env_logger::init();
+    let _ = std::fs::remove_dir_all("test_db");
     let result = fuzzcheck::fuzz_test(compare_with_btree_map)
         .default_options()
         .stop_after_first_test_failure(true)

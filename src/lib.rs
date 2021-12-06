@@ -202,7 +202,7 @@ impl<const K: usize, const V: usize> Worker<K, V> {
         if self.sstable_directory.len() > 1
             && on_disk_size / (self.db_sz + 1) > self.config.max_space_amp
         {
-            log::info!(
+            log::debug!(
                 "performing full compaction, decompressed on-disk \
                 database size has grown beyond {}x the in-memory size",
                 self.config.max_space_amp
@@ -440,10 +440,6 @@ pub struct Lsm<const K: usize, const V: usize> {
 
 impl<const K: usize, const V: usize> Drop for Lsm<K, V> {
     fn drop(&mut self) {
-        if let Err(e) = self.flush() {
-            log::error!("failed to flush while dropping Lsm: {:?}", e);
-        }
-
         let (tx, rx) = mpsc::channel();
 
         if self.worker_outbox.send(WorkerMessage::Stop(tx)).is_err() {
@@ -678,13 +674,14 @@ impl<const K: usize, const V: usize> Lsm<K, V> {
             let sst_sz = 8 + (memtable.len() as u64 * (4 + K + V) as u64);
             let db_sz = self.db.len() as u64 * (K + V) as u64;
 
-            self.worker_outbox
-                .send(WorkerMessage::NewSST {
-                    id: sst_id,
-                    sst_sz,
-                    db_sz,
-                })
-                .expect("compactor must outlive db");
+            if let Err(e) = self.worker_outbox.send(WorkerMessage::NewSST {
+                id: sst_id,
+                sst_sz,
+                db_sz,
+            }) {
+                log::error!("failed to send message to worker: {:?}", e);
+                panic!("failed to send message to worker: {:?}", e);
+            }
 
             self.next_sstable_id += 1;
 
