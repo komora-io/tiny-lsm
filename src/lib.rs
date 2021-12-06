@@ -159,6 +159,7 @@ struct Worker<const K: usize, const V: usize> {
     db_sz: u64,
     path: PathBuf,
     config: Config,
+    stats: Arc<WorkerStats>,
 }
 
 impl<const K: usize, const V: usize> Worker<K, V> {
