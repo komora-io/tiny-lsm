@@ -164,58 +164,45 @@ struct Worker<const K: usize, const V: usize> {
 
 impl<const K: usize, const V: usize> Worker<K, V> {
     fn run(mut self) {
-        loop {
-            match self.inbox.try_recv() {
-                Ok(WorkerMessage::NewSST { id, sst_sz, db_sz }) => {
-                    self.db_sz = db_sz;
-                    self.sstable_directory.insert(id, sst_sz);
+        let mut running = true;
+        while running {
+            match self.inbox.recv() {
+                Ok(message) => {
+                    running = self.handle_message(message);
                 }
-                Ok(WorkerMessage::Stop(dropper)) => {
-                    drop(dropper);
-                    return;
-                }
-                Ok(WorkerMessage::Heartbeat(dropper)) => {
-                    drop(dropper);
-                }
-                Err(mpsc::TryRecvError::Empty) => {}
-                Err(mpsc::TryRecvError::Disconnected) => {
-                    log::info!("tiny-lsm compaction worker quitting");
-                    return;
-                }
-            };
-
-            let res = self.sstable_maintenance();
-            match res {
-                Ok(false) => {}
-                Ok(true) => continue,
-                Err(e) => {
-                    log::error!("error while compacting sstables in the background: {:?}", e);
+                Err(mpsc::RecvError) => {
+                    break;
                 }
             }
 
-            // no work to do, wait for new sstables
-            match self.inbox.recv() {
-                Ok(WorkerMessage::NewSST { id, sst_sz, db_sz }) => {
-                    self.db_sz = db_sz;
-                    self.sstable_directory.insert(id, sst_sz);
-                }
-                Ok(WorkerMessage::Stop(dropper)) => {
-                    drop(dropper);
-                    log::info!("tiny-lsm compaction worker quitting");
-                    return;
-                }
-                Ok(WorkerMessage::Heartbeat(dropper)) => {
-                    drop(dropper);
-                }
-                Err(mpsc::RecvError) => {
-                    log::info!("tiny-lsm compaction worker quitting");
-                    return;
-                }
+            // only compact one run at a time before checking
+            // for new messages.
+            if let Err(e) = self.sstable_maintenance() {
+                log::error!("error while compacting sstables in the background: {:?}", e);
+            }
+        }
+        log::info!("tiny-lsm compaction worker quitting");
+    }
+
+    fn handle_message(&mut self, message: WorkerMessage) -> bool {
+        match message {
+            WorkerMessage::NewSST { id, sst_sz, db_sz } => {
+                self.db_sz = db_sz;
+                self.sstable_directory.insert(id, sst_sz);
+                true
+            }
+            WorkerMessage::Stop(dropper) => {
+                drop(dropper);
+                false
+            }
+            WorkerMessage::Heartbeat(dropper) => {
+                drop(dropper);
+                true
             }
         }
     }
 
-    fn sstable_maintenance(&mut self) -> Result<bool> {
+    fn sstable_maintenance(&mut self) -> Result<()> {
         let on_disk_size: u64 = self.sstable_directory.values().sum();
 
         log::debug!("disk size: {} mem size: {}", on_disk_size, self.db_sz);
@@ -230,11 +217,11 @@ impl<const K: usize, const V: usize> Worker<K, V> {
             let run_to_compact: Vec<u64> = self.sstable_directory.keys().copied().collect();
 
             self.compact_sstable_run(&run_to_compact)?;
-            return Ok(true);
+            return Ok(());
         }
 
         if self.sstable_directory.len() < self.config.merge_window {
-            return Ok(false);
+            return Ok(());
         }
 
         for window in self
@@ -251,11 +238,11 @@ impl<const K: usize, const V: usize> Worker<K, V> {
                 let run_to_compact: Vec<u64> = window.into_iter().map(|(id, _sum)| **id).collect();
 
                 self.compact_sstable_run(&run_to_compact)?;
-                return Ok(true);
+                return Ok(());
             }
         }
 
-        Ok(false)
+        Ok(())
     }
 
     // This function must be able to crash at any point without
@@ -311,7 +298,6 @@ impl<const K: usize, const V: usize> Worker<K, V> {
                 .remove(sstable_id)
                 .expect("compacted sst not present in sstable_directory");
         }
-
         fs::File::open(self.path.join(SSTABLE_DIR))?.sync_all()?;
 
         Ok(())
