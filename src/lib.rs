@@ -546,11 +546,20 @@ impl<const K: usize, const V: usize> Lsm<K, V> {
 
         let mut memtable = BTreeMap::new();
         let mut recovered = 0;
+        let mut write_batch = None;
+        let mut wb_remaining = 0;
+        let mut wb_recovered = 0;
         while let Ok(()) = reader.read_exact(&mut buf) {
             let crc_expected: u32 = u32::from_le_bytes(buf[0..4].try_into().unwrap());
             let d: bool = match buf[4] {
                 0 => false,
                 1 => true,
+                2 if write_batch.is_none() => {
+                    // begin batch
+                    write_batch = Some(Vec::with_capacity(crc_expected as usize));
+                    wb_remaining = crc_expected as usize;
+                    continue;
+                }
                 _ => {
                     // need to back up a few bytes to chop off the torn log
                     let log_file = reader.get_mut();
@@ -579,14 +588,39 @@ impl<const K: usize, const V: usize> Lsm<K, V> {
                 break;
             }
 
-            recovered += buf.len() as u64;
+            if let Some(ref mut wb) = write_batch {
+                wb.push((k, v));
+                wb_remaining -= 1;
+                wb_recovered += buf.len() as u64;
 
-            memtable.insert(k, v);
+                // apply the write batch all at once
+                // or never at all
+                if wb_remaining == 0 {
+                    for (k, v) in std::mem::take(wb) {
+                        memtable.insert(k, v);
 
-            if let Some(v) = v {
-                db.insert(k, v);
+                        if let Some(v) = v {
+                            db.insert(k, v);
+                        } else {
+                            db.remove(&k);
+                        }
+                    }
+                    recovered += wb_recovered;
+                    wb_recovered = 0;
+                }
             } else {
-                db.remove(&k);
+                assert_eq!(0, wb_remaining);
+                assert_eq!(0, wb_recovered);
+
+                memtable.insert(k, v);
+
+                if let Some(v) = v {
+                    db.insert(k, v);
+                } else {
+                    db.remove(&k);
+                }
+
+                recovered += buf.len() as u64;
             }
         }
 
@@ -645,6 +679,11 @@ impl<const K: usize, const V: usize> Lsm<K, V> {
     pub fn insert(&mut self, k: [u8; K], v: [u8; V]) -> Result<Option<[u8; V]>> {
         assert_ne!([k[0], v[0]], [255, 254]);
         self.log_mutation(k, Some(v))?;
+
+        if self.dirty_bytes > self.config.max_log_length {
+            self.flush()?;
+        }
+
         Ok(self.db.insert(k, v))
     }
 
@@ -657,7 +696,58 @@ impl<const K: usize, const V: usize> Lsm<K, V> {
     /// durable, use the `Lsm::flush` method below.
     pub fn remove(&mut self, k: &[u8; K]) -> Result<Option<[u8; V]>> {
         self.log_mutation(*k, None)?;
+
+        if self.dirty_bytes > self.config.max_log_length {
+            self.flush()?;
+        }
+
         Ok(self.db.remove(k))
+    }
+
+    /// Apply a set of updates to the `Lsm` and
+    /// log them to disk in a way that will
+    /// be recovered only if every update is
+    /// present.
+    pub fn write_batch(&mut self, write_batch: &[([u8; K], Option<[u8; V]>)]) -> Result<()> {
+        if write_batch.len() > u32::MAX as usize {
+            log::error!("write batches over 2^32 in size are not yet supported.");
+
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "write batches over 2^32 in size \
+                are not yet supported by tiny-lsm",
+            ));
+        }
+
+        // hack: use the crc bytes as the batch
+        // length for now. later we will make the
+        // length protected by its own crc as well.
+        let batch_len: [u8; 4] = u32::try_from(write_batch.len()).unwrap().to_le_bytes();
+        self.log.write_all(&batch_len)?;
+
+        self.log.write_all(&[2_u8])?;
+
+        // the zero pad is necessary because every
+        // log entry must have the same length
+        let zero_pad = vec![0_u8; K + V];
+        self.log.write_all(&zero_pad)?;
+
+        for (k, v_opt) in write_batch {
+            if let Some(v) = v_opt {
+                self.db.insert(*k, *v);
+            } else {
+                self.db.remove(k);
+            }
+
+            self.log_mutation(*k, *v_opt)?;
+            self.memtable.insert(*k, *v_opt);
+        }
+
+        if self.dirty_bytes > self.config.max_log_length {
+            self.flush()?;
+        }
+
+        Ok(())
     }
 
     fn log_mutation(&mut self, k: [u8; K], v: Option<[u8; V]>) -> Result<()> {
@@ -679,10 +769,6 @@ impl<const K: usize, const V: usize> Lsm<K, V> {
         self.dirty_bytes += logged_bytes;
         self.stats.logged_bytes += logged_bytes as u64;
         self.stats.written_bytes += logged_bytes as u64;
-
-        if self.dirty_bytes > self.config.max_log_length {
-            self.flush()?;
-        }
 
         Ok(())
     }

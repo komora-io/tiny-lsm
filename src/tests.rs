@@ -8,7 +8,8 @@ use serde::{Deserialize, Serialize};
 enum Operation {
     Insert(u8, u8),
     Remove(u8),
-    //Contains(u8),
+    Contains(u8),
+    Batch(Vec<(u8, Option<u8>)>),
     Restart,
 }
 
@@ -50,13 +51,25 @@ fn compare_with_btree_map(operations: &[Operation]) {
                 let b = map.remove(&[*key]);
                 assert_eq!(a, b);
             }
-            /*
             Operation::Contains(key) => {
                 let a = lsm.contains_key(&[*key]);
                 let b = map.contains_key(&[*key]);
                 assert_eq!(a, b);
             }
-            */
+            Operation::Batch(batch) => {
+                let mut wb = vec![];
+                for (k, v) in batch {
+                    if let Some(v) = v {
+                        map.insert([*k], [*v]);
+                        wb.push(([*k], Some([*v])));
+                    } else {
+                        map.remove(&[*k]);
+                        wb.push(([*k], None));
+                    }
+                }
+
+                lsm.write_batch(&wb).unwrap();
+            }
             Operation::Restart => {
                 lsm.flush().unwrap();
                 drop(lsm);
@@ -84,6 +97,7 @@ fn fuzz() {
         .default_options()
         .stop_after_first_test_failure(true)
         .launch();
+    let _ = std::fs::remove_dir_all("test_db");
     assert!(!result.found_test_failure);
 }
 
