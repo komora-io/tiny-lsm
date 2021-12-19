@@ -147,6 +147,14 @@ fn hash<const K: usize, const V: usize>(k: &[u8; K], v: &Option<[u8; V]>) -> u32
     hasher.finalize() ^ 0xFF
 }
 
+#[inline]
+fn hash_batch_len(len: usize) -> u32 {
+    let mut hasher = crc32fast::Hasher::new();
+    hasher.update(&(len as u64).to_le_bytes());
+
+    hasher.finalize() ^ 0xFF
+}
+
 enum WorkerMessage {
     NewSST { id: u64, sst_sz: u64, db_sz: u64 },
     Stop(mpsc::Sender<()>),
@@ -178,7 +186,11 @@ impl<const K: usize, const V: usize> Worker<K, V> {
             // only compact one run at a time before checking
             // for new messages.
             if let Err(e) = self.sstable_maintenance() {
-                log::error!("error while compacting sstables in the background: {:?}", e);
+                log::error!(
+                    "error while compacting sstables \
+                    in the background: {:?}",
+                    e
+                );
             }
         }
         log::info!("tiny-lsm compaction worker quitting");
@@ -450,6 +462,9 @@ pub struct Lsm<const K: usize, const V: usize> {
     worker_outbox: mpsc::Sender<WorkerMessage>,
     next_sstable_id: u64,
     dirty_bytes: usize,
+    #[cfg(test)]
+    pub log: tearable::Tearable<fs::File>,
+    #[cfg(not(test))]
     log: BufWriter<fs::File>,
     path: PathBuf,
     config: Config,
@@ -542,7 +557,8 @@ impl<const K: usize, const V: usize> Lsm<K, V> {
 
         let mut reader = BufReader::new(log);
 
-        let mut buf = vec![0; 5 + K + V];
+        let min_tuple_sz = std::mem::size_of::<u64>().max(K + V);
+        let mut buf = vec![0; 5 + min_tuple_sz];
 
         let mut memtable = BTreeMap::new();
         let mut recovered = 0;
@@ -550,24 +566,45 @@ impl<const K: usize, const V: usize> Lsm<K, V> {
         let mut wb_remaining = 0;
         let mut wb_recovered = 0;
         while let Ok(()) = reader.read_exact(&mut buf) {
-            let crc_expected: u32 = u32::from_le_bytes(buf[0..4].try_into().unwrap());
-            let d: bool = match buf[4] {
-                0 => false,
-                1 => true,
-                2 if write_batch.is_none() => {
-                    // begin batch
-                    write_batch = Some(Vec::with_capacity(crc_expected as usize));
-                    wb_remaining = crc_expected as usize;
-                    continue;
-                }
-                _ => {
+            macro_rules! rewind {
+                () => {
                     // need to back up a few bytes to chop off the torn log
+                    log::warn!("detected log tear. chopping length to {}", recovered);
                     let log_file = reader.get_mut();
                     log_file.seek(io::SeekFrom::Start(recovered))?;
                     log_file.set_len(recovered)?;
                     log_file.sync_all()?;
                     fs::File::open(path.join(SSTABLE_DIR))?.sync_all()?;
                     break;
+                };
+            }
+            let crc_expected: u32 = u32::from_le_bytes(buf[0..4].try_into().unwrap());
+            let d: bool = match buf[4] {
+                0 => false,
+                1 => true,
+                2 if write_batch.is_none() => {
+                    // begin batch
+                    let batch_sz_buf: [u8; 8] = buf[5..5 + 8].try_into().unwrap();
+                    let batch_sz: u64 = u64::from_le_bytes(batch_sz_buf);
+
+                    if batch_sz > usize::MAX as u64 {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidInput,
+                            "recovering a batch size over usize::MAX is not supported",
+                        ));
+                    }
+
+                    let crc_actual = hash_batch_len(usize::try_from(batch_sz).unwrap());
+                    if crc_expected != crc_actual {
+                        rewind!();
+                    }
+
+                    write_batch = Some(Vec::with_capacity(batch_sz as usize));
+                    wb_remaining = crc_expected as usize;
+                    continue;
+                }
+                _ => {
+                    rewind!();
                 }
             };
             let k: [u8; K] = buf[5..K + 5].try_into().unwrap();
@@ -579,13 +616,7 @@ impl<const K: usize, const V: usize> Lsm<K, V> {
             let crc_actual: u32 = hash(&k, &v);
 
             if crc_expected != crc_actual {
-                // need to back up a few bytes to chop off the torn log
-                let log_file = reader.get_mut();
-                log_file.seek(io::SeekFrom::Start(recovered))?;
-                log_file.set_len(recovered)?;
-                log_file.sync_all()?;
-                fs::File::open(path.join(SSTABLE_DIR))?.sync_all()?;
-                break;
+                rewind!();
             }
 
             if let Some(ref mut wb) = write_batch {
@@ -646,7 +677,10 @@ impl<const K: usize, const V: usize> Lsm<K, V> {
         for _ in hb_rx {}
 
         let lsm = Lsm {
+            #[cfg(not(test))]
             log: BufWriter::with_capacity(config.log_bufwriter_size, reader.into_inner()),
+            #[cfg(test)]
+            log: tearable::Tearable::new(reader.into_inner()),
             path: path.into(),
             next_sstable_id: max_sstable_id.unwrap_or(0) + 1,
             dirty_bytes: recovered as usize,
@@ -709,28 +743,20 @@ impl<const K: usize, const V: usize> Lsm<K, V> {
     /// be recovered only if every update is
     /// present.
     pub fn write_batch(&mut self, write_batch: &[([u8; K], Option<[u8; V]>)]) -> Result<()> {
-        if write_batch.len() > u32::MAX as usize {
-            log::error!("write batches over 2^32 in size are not yet supported.");
+        let batch_len: [u8; 8] = (write_batch.len() as u64).to_le_bytes();
+        let crc = hash_batch_len(write_batch.len());
 
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "write batches over 2^32 in size \
-                are not yet supported by tiny-lsm",
-            ));
-        }
-
-        // hack: use the crc bytes as the batch
-        // length for now. later we will make the
-        // length protected by its own crc as well.
-        let batch_len: [u8; 4] = u32::try_from(write_batch.len()).unwrap().to_le_bytes();
+        self.log.write_all(&crc.to_le_bytes())?;
+        self.log.write_all(&[2_u8])?;
         self.log.write_all(&batch_len)?;
 
-        self.log.write_all(&[2_u8])?;
-
-        // the zero pad is necessary because every
-        // log entry must have the same length
-        let zero_pad = vec![0_u8; K + V];
-        self.log.write_all(&zero_pad)?;
+        // the zero pad is necessary because every log
+        // entry must have the same length, whether
+        // it's a batch size or actual kv tuple.
+        let min_tuple_sz = std::mem::size_of::<u64>().max(K + V);
+        let pad_sz = min_tuple_sz - (K + V);
+        let pad = [0; std::mem::size_of::<u64>()];
+        self.log.write_all(&pad[..pad_sz])?;
 
         for (k, v_opt) in write_batch {
             if let Some(v) = v_opt {
@@ -762,7 +788,15 @@ impl<const K: usize, const V: usize> Lsm<K, V> {
             self.log.write_all(&[0; V])?;
         };
 
-        let logged_bytes = 4 + 1 + K + V;
+        // the zero pad is necessary because every log
+        // entry must have the same length, whether
+        // it's a batch size or actual kv tuple.
+        let min_tuple_sz = std::mem::size_of::<u64>().max(K + V);
+        let pad_sz = min_tuple_sz - (K + V);
+        let pad = [0; std::mem::size_of::<u64>()];
+        self.log.write_all(&pad[..pad_sz])?;
+
+        let logged_bytes = 4 + 1 + min_tuple_sz;
 
         self.memtable.insert(k, v);
 
@@ -782,6 +816,13 @@ impl<const K: usize, const V: usize> Lsm<K, V> {
     /// been written, fsynced, and the sstable
     /// directory has been fsyced.
     pub fn flush(&mut self) -> Result<()> {
+        #[cfg(test)]
+        {
+            if self.log.tearing {
+                return Ok(());
+            }
+        }
+
         self.log.flush()?;
         self.log.get_mut().sync_all()?;
 
@@ -810,8 +851,6 @@ impl<const K: usize, const V: usize> Lsm<K, V> {
             }
 
             self.next_sstable_id += 1;
-
-            assert_eq!(self.log.buffer().len(), 0);
 
             let log_file: &mut fs::File = self.log.get_mut();
             log_file.seek(io::SeekFrom::Start(0))?;
@@ -848,4 +887,7 @@ impl<const K: usize, const V: usize> Lsm<K, V> {
 }
 
 #[cfg(test)]
-mod tests;
+mod tearable;
+
+#[cfg(test)]
+mod fuzz;

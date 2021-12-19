@@ -1,4 +1,5 @@
 use std::collections::BTreeMap;
+use std::io::Write;
 use std::ops::Deref;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -10,6 +11,7 @@ enum Operation {
     Remove(u8),
     Contains(u8),
     Batch(Vec<(u8, Option<u8>)>),
+    TornBatch(Vec<(u8, Option<u8>)>, usize, bool),
     Restart,
 }
 
@@ -35,11 +37,6 @@ fn compare_with_btree_map(operations: &[Operation]) {
     let mut lsm = crate::Lsm::<1, 1>::recover_with_config(&path, config).unwrap();
     let mut map = BTreeMap::<[u8; 1], [u8; 1]>::new();
     for op in operations {
-        /*
-        println!();
-        println!("op: {:?}", op);
-        println!("lsm before: {:?}", lsm.deref());
-        */
         match op {
             Operation::Insert(key, value) => {
                 let a = lsm.insert([*key], [*value]).unwrap();
@@ -70,13 +67,40 @@ fn compare_with_btree_map(operations: &[Operation]) {
 
                 lsm.write_batch(&wb).unwrap();
             }
+            Operation::TornBatch(batch, tear_offset, corrupt) => {
+                // this tests torn batches which
+                // should not be present in the
+                // db after recovering.
+
+                lsm.log.begin_tear();
+
+                let mut wb = vec![];
+                for (k, v) in batch {
+                    if let Some(v) = v {
+                        wb.push(([*k], Some([*v])));
+                    } else {
+                        wb.push(([*k], None));
+                    }
+                }
+
+                lsm.write_batch(&wb).unwrap();
+
+                lsm.log.apply_tear(*tear_offset, *corrupt);
+
+                lsm.log.flush().unwrap();
+
+                drop(lsm);
+
+                lsm = crate::Lsm::recover_with_config(&path, config).unwrap();
+
+                // lsm should be the same as if the batch was never applied
+            }
             Operation::Restart => {
                 lsm.flush().unwrap();
                 drop(lsm);
                 lsm = crate::Lsm::recover_with_config(&path, config).unwrap();
             }
         }
-        // println!("lsm after: {:?}", lsm.deref());
         assert_eq!(
             lsm.deref(),
             &map,
@@ -90,8 +114,8 @@ fn compare_with_btree_map(operations: &[Operation]) {
 }
 
 #[test]
-fn fuzz() {
-    //env_logger::init();
+fn check() {
+    env_logger::init();
     let _ = std::fs::remove_dir_all("test_db");
     let result = fuzzcheck::fuzz_test(compare_with_btree_map)
         .default_options()
@@ -106,7 +130,7 @@ fn fuzz() {
 fn trophy_00() {
     let json = std::fs::read_to_string("trophy_case/00.json").unwrap();
     let ops: Vec<Operation> = serde_json::from_str(&json).unwrap();
-    compare_with_btree_map(&ops[0..]);
+    compare_with_btree_map(&ops[..]);
 }
 
 #[test]
