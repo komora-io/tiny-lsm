@@ -122,13 +122,13 @@ struct WorkerStats {
 
 #[derive(Debug, Clone, Copy)]
 pub struct Stats {
-    resident_bytes: u64,
-    on_disk_bytes: u64,
-    logged_bytes: u64,
-    written_bytes: u64,
-    read_bytes: u64,
-    space_amp: f64,
-    write_amp: f64,
+    pub resident_bytes: u64,
+    pub on_disk_bytes: u64,
+    pub logged_bytes: u64,
+    pub written_bytes: u64,
+    pub read_bytes: u64,
+    pub space_amp: f64,
+    pub write_amp: f64,
 }
 
 fn hash<const K: usize, const V: usize>(k: &[u8; K], v: &Option<[u8; V]>) -> u32 {
