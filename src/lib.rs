@@ -592,6 +592,15 @@ impl<const K: usize, const V: usize> Lsm<K, V> {
                         break;
                     }
 
+                    if !buf[5 + U64_SZ..].iter().all(|e| *e == 0) {
+                        log::warn!(
+                            "expected all pad bytes after logged \
+                            batch manifests to be zero, but some \
+                            corruption was detected"
+                        );
+                        break;
+                    }
+
                     if batch_sz > usize::MAX as u64 {
                         return Err(io::Error::new(
                             io::ErrorKind::InvalidInput,
@@ -634,6 +643,14 @@ impl<const K: usize, const V: usize> Lsm<K, V> {
                     v,
                     crc_expected,
                     crc_actual
+                );
+                break;
+            }
+
+            if !buf[5 + K + V..].iter().all(|e| *e == 0) {
+                log::warn!(
+                    "expected all pad bytes for logged kv entries \
+                    to be zero, but some corruption was detected"
                 );
                 break;
             }
