@@ -10,7 +10,7 @@ enum Operation {
     Remove(u8),
     Contains(u8),
     Batch(Vec<(u8, Option<u8>)>),
-    TornBatch(Vec<(u8, Option<u8>)>, usize, bool),
+    TornBatch(Vec<(u8, Option<u8>)>, usize),
     Restart,
 }
 
@@ -24,12 +24,12 @@ fn compare_with_btree_map(args: &Args) {
     static NDB: AtomicUsize = AtomicUsize::new(0);
 
     let path = format!(
-        "test_db/fuzzcheck-test-{}",
+        "test_fuzz_db/fuzzcheck-test-{}",
         NDB.fetch_add(1, Ordering::SeqCst)
     );
-    let _ = std::fs::remove_dir_all(&path);
 
     let _ = std::fs::remove_dir_all(&path);
+
     let mut lsm = crate::Lsm::<1, 1>::recover_with_config(&path, args.config).unwrap();
     let mut map = BTreeMap::<[u8; 1], [u8; 1]>::new();
     for op in &args.ops {
@@ -63,7 +63,7 @@ fn compare_with_btree_map(args: &Args) {
 
                 lsm.write_batch(&wb).unwrap();
             }
-            Operation::TornBatch(batch, tear_offset, corrupt) => {
+            Operation::TornBatch(batch, tear_offset) => {
                 // this tests torn batches which
                 // should not be present in the
                 // db after recovering.
@@ -83,7 +83,7 @@ fn compare_with_btree_map(args: &Args) {
 
                 lsm.write_batch(&wb).unwrap();
 
-                lsm.log.apply_tear(*tear_offset, *corrupt);
+                lsm.log.apply_tear(*tear_offset, false);
 
                 drop(lsm);
 
@@ -113,30 +113,11 @@ fn compare_with_btree_map(args: &Args) {
 #[test]
 fn check() {
     env_logger::init();
-    let _ = std::fs::remove_dir_all("test_db");
+    let _ = std::fs::remove_dir_all("test_fuzz_db");
     let result = fuzzcheck::fuzz_test(compare_with_btree_map)
         .default_options()
         .stop_after_first_test_failure(true)
         .launch();
-    let _ = std::fs::remove_dir_all("test_db");
+    let _ = std::fs::remove_dir_all("test_fuzz_db");
     assert!(!result.found_test_failure);
 }
-
-/*
-#[test]
-fn trophy_00() {
-    env_logger::init();
-    let json = std::fs::read_to_string("trophy_case/00.json").unwrap();
-    let args: Args = serde_json::from_str(&json).unwrap();
-    compare_with_btree_map(&args);
-}
-
-#[test]
-fn t1() {
-    compare_with_btree_map(&[
-        Operation::Insert(220, 53),
-        Operation::Restart,
-        Operation::Restart,
-    ]);
-}
-*/

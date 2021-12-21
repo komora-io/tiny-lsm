@@ -9,7 +9,7 @@
 //! filters on the sstables, and read operations cannot fail due
 //! to IO issues.
 //!
-//! `Lsm` implements `Deref<Target=BTree<[u8; K], [u8; V]>>`
+//! `Lsm` implements `Deref<Target=BTreeMap<[u8; K], [u8; V]>>`
 //! to immutably access the data directly without any IO or
 //! blocking.
 //!
@@ -31,15 +31,11 @@
 //! is intended to maintain metadata in more complex systems.
 //!
 //! There is currently no compaction throttling. You can play
-//! with the constants around compaction to change compaction
+//! with the `Config` options around compaction to change compaction
 //! characteristics.
 //!
 //! Never change the constant size of keys or values for an existing
 //! database.
-//!
-//! Basically untested, but on the flip side there are less
-//! than 500 lines of bugs. Let it be a case study for how
-//! many bugs can exist in a codebase with 0 usage of unsafe.
 //!
 //! # Examples
 //!
@@ -56,8 +52,6 @@
 //!
 //! ```
 #![cfg_attr(test, feature(no_coverage))]
-#![macro_use]
-extern crate zstd;
 
 use std::collections::BTreeMap;
 use std::fs;
@@ -634,6 +628,7 @@ impl<const K: usize, const V: usize> Lsm<K, V> {
             } else {
                 None
             };
+
             let crc_actual: u32 = hash(&k, &v);
 
             if crc_expected != crc_actual {
@@ -647,7 +642,9 @@ impl<const K: usize, const V: usize> Lsm<K, V> {
                 break;
             }
 
-            if !buf[5 + K + V..].iter().all(|e| *e == 0) {
+            let pad_start = if v.is_some() { 5 + K + V } else { 5 + K };
+
+            if !buf[pad_start..].iter().all(|e| *e == 0) {
                 log::warn!(
                     "expected all pad bytes for logged kv entries \
                     to be zero, but some corruption was detected"
@@ -932,5 +929,5 @@ impl<const K: usize, const V: usize> Lsm<K, V> {
 #[cfg(test)]
 mod tearable;
 
-#[cfg(test)]
+#[cfg(all(test, not(feature = "no_fuzz")))]
 mod fuzz;
