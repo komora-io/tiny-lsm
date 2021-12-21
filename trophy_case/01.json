@@ -1,0 +1,1 @@
+{"ops":[],"config":{"max_space_amp":23,"max_log_length":2967489108446635161,"merge_ratio":190,"merge_window":0,"log_bufwriter_size":1301844105,"zstd_sstable_compression_level":168}}

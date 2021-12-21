@@ -168,29 +168,35 @@ struct Worker<const K: usize, const V: usize> {
 }
 
 impl<const K: usize, const V: usize> Worker<K, V> {
+    #[cfg(not(test))]
     fn run(mut self) {
-        let mut running = true;
-        while running {
-            match self.inbox.recv() {
-                Ok(message) => {
-                    running = self.handle_message(message);
-                }
-                Err(mpsc::RecvError) => {
-                    break;
+        while self.tick() {}
+        log::info!("tiny-lsm compaction worker quitting");
+    }
+
+    fn tick(&mut self) -> bool {
+        match self.inbox.recv() {
+            Ok(message) => {
+                if !self.handle_message(message) {
+                    return false;
                 }
             }
-
-            // only compact one run at a time before checking
-            // for new messages.
-            if let Err(e) = self.sstable_maintenance() {
-                log::error!(
-                    "error while compacting sstables \
-                    in the background: {:?}",
-                    e
-                );
+            Err(mpsc::RecvError) => {
+                return false;
             }
         }
-        log::info!("tiny-lsm compaction worker quitting");
+
+        // only compact one run at a time before checking
+        // for new messages.
+        if let Err(e) = self.sstable_maintenance() {
+            log::error!(
+                "error while compacting sstables \
+                in the background: {:?}",
+                e
+            );
+        }
+
+        true
     }
 
     fn handle_message(&mut self, message: WorkerMessage) -> bool {
@@ -229,7 +235,7 @@ impl<const K: usize, const V: usize> Worker<K, V> {
             return Ok(());
         }
 
-        if self.sstable_directory.len() < self.config.merge_window as usize {
+        if self.sstable_directory.len() < self.config.merge_window.max(2) as usize {
             return Ok(());
         }
 
@@ -237,7 +243,7 @@ impl<const K: usize, const V: usize> Worker<K, V> {
             .sstable_directory
             .iter()
             .collect::<Vec<_>>()
-            .windows(self.config.merge_window as usize)
+            .windows(self.config.merge_window.max(2) as usize)
         {
             if window
                 .iter()
@@ -463,6 +469,8 @@ pub struct Lsm<const K: usize, const V: usize> {
     next_sstable_id: u64,
     dirty_bytes: usize,
     #[cfg(test)]
+    worker: Worker<K, V>,
+    #[cfg(test)]
     pub log: tearable::Tearable<fs::File>,
     #[cfg(not(test))]
     log: BufWriter<fs::File>,
@@ -480,6 +488,9 @@ impl<const K: usize, const V: usize> Drop for Lsm<K, V> {
             log::error!("failed to shut down compaction worker on Lsm drop");
             return;
         }
+
+        #[cfg(test)]
+        assert!(!self.worker.tick());
 
         for _ in rx {}
     }
@@ -711,9 +722,18 @@ impl<const K: usize, const V: usize> Lsm<K, V> {
             stats: worker_stats.clone(),
         };
 
+        #[cfg(not(test))]
         std::thread::spawn(move || worker.run());
+
         let (hb_tx, hb_rx) = mpsc::channel();
         tx.send(WorkerMessage::Heartbeat(hb_tx)).unwrap();
+
+        #[cfg(test)]
+        let mut worker = worker;
+
+        #[cfg(test)]
+        assert!(worker.tick());
+
         for _ in hb_rx {}
 
         let lsm = Lsm {
@@ -721,6 +741,8 @@ impl<const K: usize, const V: usize> Lsm<K, V> {
             log: BufWriter::with_capacity(config.log_bufwriter_size as usize, reader.into_inner()),
             #[cfg(test)]
             log: tearable::Tearable::new(reader.into_inner()),
+            #[cfg(test)]
+            worker,
             path: path.into(),
             next_sstable_id: max_sstable_id.unwrap_or(0) + 1,
             dirty_bytes: recovered as usize,
@@ -890,6 +912,9 @@ impl<const K: usize, const V: usize> Lsm<K, V> {
                 panic!("failed to send message to worker: {:?}", e);
             }
 
+            #[cfg(test)]
+            assert!(self.worker.tick());
+
             self.next_sstable_id += 1;
 
             let log_file: &mut fs::File = self.log.get_mut();
@@ -929,5 +954,5 @@ impl<const K: usize, const V: usize> Lsm<K, V> {
 #[cfg(test)]
 mod tearable;
 
-#[cfg(all(test, not(feature = "no_fuzz")))]
+#[cfg(test)]
 mod fuzz;
