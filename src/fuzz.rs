@@ -1,5 +1,4 @@
 use std::collections::BTreeMap;
-use std::io::Write;
 use std::ops::Deref;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -85,8 +84,6 @@ fn compare_with_btree_map(args: &Args) {
                 lsm.write_batch(&wb).unwrap();
 
                 lsm.log.apply_tear(*tear_offset, *corrupt);
-
-                lsm.log.flush().unwrap();
 
                 drop(lsm);
 

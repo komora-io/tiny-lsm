@@ -69,6 +69,7 @@ use std::sync::{
 };
 
 const SSTABLE_DIR: &str = "sstables";
+const U64_SZ: usize = std::mem::size_of::<u64>();
 
 #[derive(Debug, Clone, Copy)]
 #[cfg_attr(
@@ -539,12 +540,6 @@ impl<const K: usize, const V: usize> Lsm<K, V> {
             }
         }
 
-        let log = fs::OpenOptions::new()
-            .create(true)
-            .read(true)
-            .write(true)
-            .open(path.join("log"))?;
-
         let sstable_directory = list_sstables(path, true)?;
 
         let mut db = BTreeMap::new();
@@ -560,16 +555,26 @@ impl<const K: usize, const V: usize> Lsm<K, V> {
 
         let max_sstable_id = sstable_directory.keys().next_back().copied();
 
+        let log = fs::OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .open(path.join("log"))?;
+
         let mut reader = BufReader::new(log);
 
-        let min_tuple_sz = std::mem::size_of::<u64>().max(K + V);
-        let mut buf = vec![0; 5 + min_tuple_sz];
+        let tuple_sz = U64_SZ.max(K + V);
+        let header_sz = 5;
+        let header_tuple_sz = header_sz + tuple_sz;
+        let mut buf = vec![0; header_tuple_sz];
 
         let mut memtable = BTreeMap::new();
         let mut recovered = 0;
-        let mut write_batch = None;
-        let mut wb_remaining = 0;
-        let mut wb_recovered = 0;
+
+        // write_batch is the pending memtable updates, the number
+        // of remaining items in the write batch, and the number of
+        // bytes that have been recovered in the write batch.
+        let mut write_batch: Option<(_, usize, u64)> = None;
         while let Ok(()) = reader.read_exact(&mut buf) {
             let crc_expected: u32 = u32::from_le_bytes(buf[0..4].try_into().unwrap());
             let d: bool = match buf[4] {
@@ -579,6 +584,13 @@ impl<const K: usize, const V: usize> Lsm<K, V> {
                     // begin batch
                     let batch_sz_buf: [u8; 8] = buf[5..5 + 8].try_into().unwrap();
                     let batch_sz: u64 = u64::from_le_bytes(batch_sz_buf);
+                    log::debug!("processing batch of len {}", batch_sz);
+
+                    let crc_actual = hash_batch_len(usize::try_from(batch_sz).unwrap());
+                    if crc_expected != crc_actual {
+                        log::warn!("crc mismatch for batch size marker");
+                        break;
+                    }
 
                     if batch_sz > usize::MAX as u64 {
                         return Err(io::Error::new(
@@ -587,14 +599,15 @@ impl<const K: usize, const V: usize> Lsm<K, V> {
                         ));
                     }
 
-                    let crc_actual = hash_batch_len(usize::try_from(batch_sz).unwrap());
-                    if crc_expected != crc_actual {
-                        log::warn!("crc mismatch for batch size marker");
-                        break;
-                    }
+                    let wb_remaining = batch_sz as usize;
+                    let wb_recovered = buf.len() as u64;
 
-                    write_batch = Some(Vec::with_capacity(batch_sz as usize));
-                    wb_remaining = crc_expected as usize;
+                    write_batch = dbg!(Some((
+                        Vec::with_capacity(batch_sz as usize),
+                        wb_remaining,
+                        wb_recovered,
+                    )));
+
                     continue;
                 }
                 _ => {
@@ -602,28 +615,34 @@ impl<const K: usize, const V: usize> Lsm<K, V> {
                     break;
                 }
             };
-            let k: [u8; K] = buf[5..K + 5].try_into().unwrap();
+            let k: [u8; K] = buf[5..5 + K].try_into().unwrap();
             let v: Option<[u8; V]> = if d {
-                Some(buf[K + 5..5 + K + V].try_into().unwrap())
+                Some(buf[5 + K..5 + K + V].try_into().unwrap())
             } else {
                 None
             };
             let crc_actual: u32 = hash(&k, &v);
 
             if crc_expected != crc_actual {
-                log::warn!("crc mismatch for kv pair, torn log detected");
+                log::warn!(
+                    "crc mismatch for kv pair {:?}-{:?}: expected {} actual {}, torn log detected",
+                    k,
+                    v,
+                    crc_expected,
+                    crc_actual
+                );
                 break;
             }
 
-            if let Some(ref mut wb) = write_batch {
+            if let Some((mut wb, mut wb_remaining, mut wb_recovered)) = write_batch.take() {
                 wb.push((k, v));
-                wb_remaining -= 1;
-                wb_recovered += buf.len() as u64;
+                wb_remaining = wb_remaining.checked_sub(1).unwrap();
+                wb_recovered = wb_recovered.checked_add(buf.len() as u64).unwrap();
 
                 // apply the write batch all at once
                 // or never at all
                 if wb_remaining == 0 {
-                    for (k, v) in std::mem::take(wb) {
+                    for (k, v) in wb {
                         memtable.insert(k, v);
 
                         if let Some(v) = v {
@@ -633,12 +652,10 @@ impl<const K: usize, const V: usize> Lsm<K, V> {
                         }
                     }
                     recovered += wb_recovered;
-                    wb_recovered = 0;
+                } else {
+                    write_batch = Some((wb, wb_remaining, wb_recovered));
                 }
             } else {
-                assert_eq!(0, wb_remaining);
-                assert_eq!(0, wb_recovered);
-
                 memtable.insert(k, v);
 
                 if let Some(v) = v {
@@ -652,6 +669,7 @@ impl<const K: usize, const V: usize> Lsm<K, V> {
         }
 
         // need to back up a few bytes to chop off the torn log
+        log::debug!("recovered {} kv pairs", db.len());
         log::debug!("rewinding log down to length {}", recovered);
         let log_file = reader.get_mut();
         log_file.seek(io::SeekFrom::Start(recovered))?;
@@ -757,9 +775,9 @@ impl<const K: usize, const V: usize> Lsm<K, V> {
         // the zero pad is necessary because every log
         // entry must have the same length, whether
         // it's a batch size or actual kv tuple.
-        let min_tuple_sz = std::mem::size_of::<u64>().max(K + V);
-        let pad_sz = min_tuple_sz - (K + V);
-        let pad = [0; std::mem::size_of::<u64>()];
+        let tuple_sz = U64_SZ.max(K + V);
+        let pad_sz = tuple_sz - U64_SZ;
+        let pad = [0; U64_SZ];
         self.log.write_all(&pad[..pad_sz])?;
 
         for (k, v_opt) in write_batch {
@@ -795,9 +813,9 @@ impl<const K: usize, const V: usize> Lsm<K, V> {
         // the zero pad is necessary because every log
         // entry must have the same length, whether
         // it's a batch size or actual kv tuple.
-        let min_tuple_sz = std::mem::size_of::<u64>().max(K + V);
+        let min_tuple_sz = U64_SZ.max(K + V);
         let pad_sz = min_tuple_sz - (K + V);
-        let pad = [0; std::mem::size_of::<u64>()];
+        let pad = [0; U64_SZ];
         self.log.write_all(&pad[..pad_sz])?;
 
         let logged_bytes = 4 + 1 + min_tuple_sz;

@@ -41,8 +41,12 @@ impl<W: Write> Tearable<W> {
 
             self.buffer[at] ^= 0xFF;
         } else {
+            log::debug!("truncating pending write buffer to length {}", at);
             self.buffer.truncate(at);
         }
+
+        self.tearing = false;
+        self.flush().unwrap();
     }
 
     pub fn get_mut(&mut self) -> &mut W {
@@ -52,7 +56,8 @@ impl<W: Write> Tearable<W> {
 
 impl<W: Write> Write for Tearable<W> {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        self.buffer.write(&buf)
+        self.buffer.extend_from_slice(&buf);
+        Ok(buf.len())
     }
 
     fn flush(&mut self) -> io::Result<()> {
@@ -61,6 +66,7 @@ impl<W: Write> Write for Tearable<W> {
         } else {
             self.inner.write_all(&self.buffer)?;
             self.inner.flush()?;
+            log::debug!("flushed {} buffered log bytes to disk", self.buffer.len());
             self.buffer.clear();
             Ok(())
         }
