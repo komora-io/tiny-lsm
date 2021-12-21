@@ -15,7 +15,13 @@ enum Operation {
     Restart,
 }
 
-fn compare_with_btree_map(operations: &[Operation]) {
+#[derive(Debug, Clone, Serialize, Deserialize, fuzzcheck::DefaultMutator)]
+struct Args {
+    ops: Vec<Operation>,
+    config: crate::Config,
+}
+
+fn compare_with_btree_map(args: &Args) {
     static NDB: AtomicUsize = AtomicUsize::new(0);
 
     let path = format!(
@@ -24,19 +30,10 @@ fn compare_with_btree_map(operations: &[Operation]) {
     );
     let _ = std::fs::remove_dir_all(&path);
 
-    let config = crate::Config {
-        max_space_amp: 2,
-        max_log_length: 6,
-        merge_ratio: 5,
-        merge_window: 3,
-        log_bufwriter_size: 1024,
-        zstd_sstable_compression_level: 1,
-    };
-
     let _ = std::fs::remove_dir_all(&path);
-    let mut lsm = crate::Lsm::<1, 1>::recover_with_config(&path, config).unwrap();
+    let mut lsm = crate::Lsm::<1, 1>::recover_with_config(&path, args.config).unwrap();
     let mut map = BTreeMap::<[u8; 1], [u8; 1]>::new();
-    for op in operations {
+    for op in &args.ops {
         match op {
             Operation::Insert(key, value) => {
                 let a = lsm.insert([*key], [*value]).unwrap();
@@ -72,6 +69,8 @@ fn compare_with_btree_map(operations: &[Operation]) {
                 // should not be present in the
                 // db after recovering.
 
+                lsm.flush().unwrap();
+
                 lsm.log.begin_tear();
 
                 let mut wb = vec![];
@@ -91,14 +90,15 @@ fn compare_with_btree_map(operations: &[Operation]) {
 
                 drop(lsm);
 
-                lsm = crate::Lsm::recover_with_config(&path, config).unwrap();
+                lsm = crate::Lsm::recover_with_config(&path, args.config).unwrap();
 
                 // lsm should be the same as if the batch was never applied
             }
             Operation::Restart => {
+                log::info!("restarting in test");
                 lsm.flush().unwrap();
                 drop(lsm);
-                lsm = crate::Lsm::recover_with_config(&path, config).unwrap();
+                lsm = crate::Lsm::recover_with_config(&path, args.config).unwrap();
             }
         }
         assert_eq!(
@@ -128,9 +128,10 @@ fn check() {
 /*
 #[test]
 fn trophy_00() {
+    env_logger::init();
     let json = std::fs::read_to_string("trophy_case/00.json").unwrap();
-    let ops: Vec<Operation> = serde_json::from_str(&json).unwrap();
-    compare_with_btree_map(&ops[..]);
+    let args: Args = serde_json::from_str(&json).unwrap();
+    compare_with_btree_map(&args);
 }
 
 #[test]

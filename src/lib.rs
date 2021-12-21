@@ -56,6 +56,8 @@
 //!
 //! ```
 #![cfg_attr(test, feature(no_coverage))]
+#![macro_use]
+extern crate zstd;
 
 use std::collections::BTreeMap;
 use std::fs;
@@ -80,7 +82,7 @@ pub struct Config {
     /// multiple versions of most of the database's keys exist
     /// in multiple sstables, but should never happen for workloads
     /// where mostly new keys are being written.
-    pub max_space_amp: u64,
+    pub max_space_amp: u8,
     /// When the log file exceeds this size, a new compressed
     /// and compacted sstable will be flushed to disk and the
     /// log file will be truncated.
@@ -89,15 +91,15 @@ pub struct Config {
     /// ranges of sstables to merge, it will require all sstables
     /// to be at least 1/`merge_ratio` * the size of the first sstable
     /// in the contiguous window under consideration.
-    pub merge_ratio: u64,
+    pub merge_ratio: u8,
     /// When the background compactor thread looks for ranges of
     /// sstables to merge, it will require ranges to be at least
     /// this long.
-    pub merge_window: usize,
+    pub merge_window: u8,
     /// All inserts go directly to a `BufWriter` wrapping the log
     /// file. This option determines how large that in-memory buffer
     /// is.
-    pub log_bufwriter_size: usize,
+    pub log_bufwriter_size: u32,
     /// The level of compression to use for the sstables with zstd.
     pub zstd_sstable_compression_level: u8,
 }
@@ -219,7 +221,7 @@ impl<const K: usize, const V: usize> Worker<K, V> {
 
         log::debug!("disk size: {} mem size: {}", on_disk_size, self.db_sz);
         if self.sstable_directory.len() > 1
-            && on_disk_size / (self.db_sz + 1) > self.config.max_space_amp
+            && on_disk_size / (self.db_sz + 1) > self.config.max_space_amp as u64
         {
             log::debug!(
                 "performing full compaction, decompressed on-disk \
@@ -232,7 +234,7 @@ impl<const K: usize, const V: usize> Worker<K, V> {
             return Ok(());
         }
 
-        if self.sstable_directory.len() < self.config.merge_window {
+        if self.sstable_directory.len() < self.config.merge_window as usize {
             return Ok(());
         }
 
@@ -240,12 +242,12 @@ impl<const K: usize, const V: usize> Worker<K, V> {
             .sstable_directory
             .iter()
             .collect::<Vec<_>>()
-            .windows(self.config.merge_window)
+            .windows(self.config.merge_window as usize)
         {
             if window
                 .iter()
                 .skip(1)
-                .all(|w| *w.1 * self.config.merge_ratio > *window[0].1)
+                .all(|w| *w.1 * self.config.merge_ratio as u64 > *window[0].1)
             {
                 let run_to_compact: Vec<u64> = window.into_iter().map(|(id, _sum)| **id).collect();
 
@@ -365,10 +367,13 @@ fn write_sstable<const K: usize, const V: usize>(
         .write(true)
         .open(&sst_path)?;
 
-    let mut bw = BufWriter::new(
-        zstd::Encoder::new(file, config.zstd_sstable_compression_level as _)
-            .expect("zstd encoder failure"),
-    );
+    let max_zstd_level = zstd::compression_level_range();
+    let zstd_level = config
+        .zstd_sstable_compression_level
+        .min(*max_zstd_level.end() as u8);
+
+    let mut bw =
+        BufWriter::new(zstd::Encoder::new(file, zstd_level as _).expect("zstd encoder failure"));
 
     bw.write_all(&(items.len() as u64).to_le_bytes())?;
 
@@ -566,18 +571,6 @@ impl<const K: usize, const V: usize> Lsm<K, V> {
         let mut wb_remaining = 0;
         let mut wb_recovered = 0;
         while let Ok(()) = reader.read_exact(&mut buf) {
-            macro_rules! rewind {
-                () => {
-                    // need to back up a few bytes to chop off the torn log
-                    log::warn!("detected log tear. chopping length to {}", recovered);
-                    let log_file = reader.get_mut();
-                    log_file.seek(io::SeekFrom::Start(recovered))?;
-                    log_file.set_len(recovered)?;
-                    log_file.sync_all()?;
-                    fs::File::open(path.join(SSTABLE_DIR))?.sync_all()?;
-                    break;
-                };
-            }
             let crc_expected: u32 = u32::from_le_bytes(buf[0..4].try_into().unwrap());
             let d: bool = match buf[4] {
                 0 => false,
@@ -596,7 +589,8 @@ impl<const K: usize, const V: usize> Lsm<K, V> {
 
                     let crc_actual = hash_batch_len(usize::try_from(batch_sz).unwrap());
                     if crc_expected != crc_actual {
-                        rewind!();
+                        log::warn!("crc mismatch for batch size marker");
+                        break;
                     }
 
                     write_batch = Some(Vec::with_capacity(batch_sz as usize));
@@ -604,7 +598,8 @@ impl<const K: usize, const V: usize> Lsm<K, V> {
                     continue;
                 }
                 _ => {
-                    rewind!();
+                    log::warn!("invalid log message discriminant detected: {}", buf[4]);
+                    break;
                 }
             };
             let k: [u8; K] = buf[5..K + 5].try_into().unwrap();
@@ -616,7 +611,8 @@ impl<const K: usize, const V: usize> Lsm<K, V> {
             let crc_actual: u32 = hash(&k, &v);
 
             if crc_expected != crc_actual {
-                rewind!();
+                log::warn!("crc mismatch for kv pair, torn log detected");
+                break;
             }
 
             if let Some(ref mut wb) = write_batch {
@@ -655,6 +651,14 @@ impl<const K: usize, const V: usize> Lsm<K, V> {
             }
         }
 
+        // need to back up a few bytes to chop off the torn log
+        log::debug!("rewinding log down to length {}", recovered);
+        let log_file = reader.get_mut();
+        log_file.seek(io::SeekFrom::Start(recovered))?;
+        log_file.set_len(recovered)?;
+        log_file.sync_all()?;
+        fs::File::open(path.join(SSTABLE_DIR))?.sync_all()?;
+
         let (tx, rx) = mpsc::channel();
 
         let worker_stats = Arc::new(WorkerStats {
@@ -678,7 +682,7 @@ impl<const K: usize, const V: usize> Lsm<K, V> {
 
         let lsm = Lsm {
             #[cfg(not(test))]
-            log: BufWriter::with_capacity(config.log_bufwriter_size, reader.into_inner()),
+            log: BufWriter::with_capacity(config.log_bufwriter_size as usize, reader.into_inner()),
             #[cfg(test)]
             log: tearable::Tearable::new(reader.into_inner()),
             path: path.into(),
