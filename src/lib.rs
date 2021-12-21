@@ -602,11 +602,11 @@ impl<const K: usize, const V: usize> Lsm<K, V> {
                     let wb_remaining = batch_sz as usize;
                     let wb_recovered = buf.len() as u64;
 
-                    write_batch = dbg!(Some((
+                    write_batch = Some((
                         Vec::with_capacity(batch_sz as usize),
                         wb_remaining,
                         wb_recovered,
-                    )));
+                    ));
 
                     continue;
                 }
