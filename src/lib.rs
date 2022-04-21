@@ -773,7 +773,6 @@ impl<const K: usize, const V: usize> Lsm<K, V> {
     /// If you require blocking until all written data is
     /// durable, use the `Lsm::flush` method below.
     pub fn insert(&mut self, k: [u8; K], v: [u8; V]) -> Result<Option<[u8; V]>> {
-        assert_ne!([k[0], v[0]], [255, 254]);
         self.log_mutation(k, Some(v))?;
 
         if self.dirty_bytes > self.config.max_log_length {
